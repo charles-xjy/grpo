@@ -11,18 +11,22 @@
   - vqa_specific.jsonl      : 图像 → Q2 具体关系/计数问答（SFT 格式）
 """
 
+import asyncio
 import base64
 import json
 import random
+import re
 from collections import defaultdict
 from pathlib import Path
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 from tqdm import tqdm
 
 # ==================== 配置 ====================
-client = OpenAI(api_key="EMPTY", base_url="http://localhost:8001/v1")
+client = AsyncOpenAI(api_key="EMPTY", base_url="http://localhost:8001/v1")
 model_name = "Qwen/Qwen3-VL-32B-Instruct"
+
+CONCURRENCY = 10
 
 DATASET_ROOT = "/home/charles/mycode/sft+rl/dataset"
 OUTPUT_DIR = Path("/home/charles/mycode/grpo/vqa_data")
@@ -262,15 +266,9 @@ def _build_second_pairs(root_path):
 
 
 def get_cot_image_set():
-    """返回 CoT 数据占用的图像路径集合（绝对路径字符串）。
-    分配规则与 construct_sft_data.py 完全一致：
-      - EBD: 每种事件前 EBD_PER_EVENT 对
-      - LEVIR-CD+: 前 LEVIR_TAKE 对
-      - SECOND: 前 SECOND_TAKE 对
-    """
+    """返回 CoT 数据占用的图像路径集合（绝对路径字符串）。"""
     cot_images = set()
 
-    # EBD
     ebd_all = _build_ebd_pairs(DATASET_ROOT + "/EBD")
     ebd_by_event = defaultdict(list)
     for p in ebd_all:
@@ -280,12 +278,10 @@ def get_cot_image_set():
             cot_images.add(str(p["pre"].resolve()))
             cot_images.add(str(p["post"].resolve()))
 
-    # LEVIR-CD+: 前 LEVIR_TAKE 对
     for p in _build_levir_pairs(DATASET_ROOT + "/LEVIR-CD+")[:LEVIR_TAKE]:
         cot_images.add(str(p["pre"].resolve()))
         cot_images.add(str(p["post"].resolve()))
 
-    # SECOND: 前 SECOND_TAKE 对
     second_all = _build_second_pairs(DATASET_ROOT + "/SECOND")
     for p in second_all[:SECOND_TAKE]:
         cot_images.add(str(p["pre"].resolve()))
@@ -330,10 +326,38 @@ def collect_unique_images(root_path, dataset_type):
     return sorted(images)
 
 
-def chat_with_image(prompt, image_path, temperature=0.7, max_tokens=2048):
-    """调用 VLM 处理单张图像。"""
+def extract_json_array(text):
+    """从文本中提取 JSON 数组。"""
+    text = text.strip()
+    try:
+        result = json.loads(text)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    for match in re.finditer(r"\[.*\]", text, re.DOTALL):
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            continue
+
+    return None
+
+
+# ==================== 异步 API 调用 ====================
+
+
+async def chat_with_image_async(prompt, image_path, temperature=0.7, max_tokens=2048):
     b64 = encode_image(image_path)
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=model_name,
         messages=[
             {
@@ -350,9 +374,8 @@ def chat_with_image(prompt, image_path, temperature=0.7, max_tokens=2048):
     return response.choices[0].message.content
 
 
-def chat_text_only(prompt, temperature=0.8, max_tokens=2048):
-    """纯文本调用 LLM（用于从描述生成 QA，不需要图像）。"""
-    response = client.chat.completions.create(
+async def chat_text_only_async(prompt, temperature=0.8, max_tokens=2048):
+    response = await client.chat.completions.create(
         model=model_name,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
@@ -361,40 +384,81 @@ def chat_text_only(prompt, temperature=0.8, max_tokens=2048):
     return response.choices[0].message.content
 
 
-def extract_json_array(text):
-    """从文本中提取 JSON 数组。"""
-    # 尝试直接解析
-    text = text.strip()
+# ==================== 主处理逻辑 ====================
+
+
+async def process_image(img_path, files, locks, fail_list, sem, pbar):
     try:
-        result = json.loads(text)
-        if isinstance(result, list):
-            return result
-    except json.JSONDecodeError:
-        pass
+        # Step 1: 生成双尺度描述（需要图像，占 1 个并发槽）
+        async with sem:
+            description = await chat_with_image_async(DUAL_SCALE_PROMPT, img_path)
 
-    # 尝试提取 ```json ... ``` 块
-    import re
-    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1).strip())
-        except json.JSONDecodeError:
-            pass
+        if not description or len(description.strip()) < 50:
+            print(f"\n[跳过] {Path(img_path).name}: 描述过短")
+            return
 
-    # 尝试找到 JSON 数组边界
-    for match in re.finditer(r"\[.*\]", text, re.DOTALL):
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            continue
+        desc_record = {
+            "messages": [
+                {"role": "user", "content": f"<image>\n{random.choice(DESC_USER_INSTRUCTIONS)}"},
+                {"role": "assistant", "content": description.strip()},
+            ],
+            "images": [img_path],
+        }
+        async with locks["desc"]:
+            files["desc"].write(json.dumps(desc_record, ensure_ascii=False) + "\n")
+            files["desc"].flush()
 
-    return None
+        # Step 2+3: Q1 和 Q2 并行生成（纯文本，各占 1 个并发槽）
+        async def gen_q1():
+            async with sem:
+                return await chat_text_only_async(Q1_GEN_PROMPT.format(num_q=4, description=description))
+
+        async def gen_q2():
+            async with sem:
+                return await chat_text_only_async(Q2_GEN_PROMPT.format(num_q=5, description=description))
+
+        q1_raw, q2_raw = await asyncio.gather(gen_q1(), gen_q2())
+
+        q1_pairs = extract_json_array(q1_raw)
+        if q1_pairs:
+            async with locks["q1"]:
+                for pair in q1_pairs:
+                    files["q1"].write(json.dumps({
+                        "messages": [
+                            {"role": "user", "content": f"<image>\n{pair['question']}"},
+                            {"role": "assistant", "content": pair["answer"]},
+                        ],
+                        "images": [img_path],
+                    }, ensure_ascii=False) + "\n")
+                files["q1"].flush()
+        else:
+            print(f"\n[Q1解析失败] {Path(img_path).name}: {q1_raw[:200]}")
+
+        q2_pairs = extract_json_array(q2_raw)
+        if q2_pairs:
+            async with locks["q2"]:
+                for pair in q2_pairs:
+                    files["q2"].write(json.dumps({
+                        "messages": [
+                            {"role": "user", "content": f"<image>\n{pair['question']}"},
+                            {"role": "assistant", "content": pair["answer"]},
+                        ],
+                        "images": [img_path],
+                    }, ensure_ascii=False) + "\n")
+                files["q2"].flush()
+        else:
+            print(f"\n[Q2解析失败] {Path(img_path).name}: {q2_raw[:200]}")
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"\n[错误] {Path(img_path).name}: {e}")
+        fail_list.append(img_path)
+    finally:
+        pbar.update(1)
 
 
-# ==================== 主程序 ====================
-
-
-def main():
+async def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     desc_file = OUTPUT_DIR / "dual_scale_desc.jsonl"
@@ -443,76 +507,24 @@ def main():
         return
 
     fail_list = []
+    sem = asyncio.Semaphore(CONCURRENCY)
+    locks = {
+        "desc": asyncio.Lock(),
+        "q1": asyncio.Lock(),
+        "q2": asyncio.Lock(),
+    }
 
     with (
         open(desc_file, "a", encoding="utf-8") as f_desc,
         open(q1_file, "a", encoding="utf-8") as f_q1,
         open(q2_file, "a", encoding="utf-8") as f_q2,
     ):
-        for img_path in tqdm(remaining, desc="生成双尺度描述+VQA"):
-            try:
-                # Step 1: 生成双尺度描述
-                description = chat_with_image(DUAL_SCALE_PROMPT, img_path, temperature=0.7, max_tokens=2048)
-
-                if not description or len(description.strip()) < 50:
-                    print(f"\n[跳过] {Path(img_path).name}: 描述过短")
-                    continue
-
-                # 写入描述数据
-                desc_record = {
-                    "messages": [
-                        {"role": "user", "content": f"<image>\n{random.choice(DESC_USER_INSTRUCTIONS)}"},
-                        {"role": "assistant", "content": description.strip()},
-                    ],
-                    "images": [img_path],
-                }
-                f_desc.write(json.dumps(desc_record, ensure_ascii=False) + "\n")
-                f_desc.flush()
-
-                # Step 2: 基于描述生成 Q1（开放式问答）
-                q1_prompt = Q1_GEN_PROMPT.format(num_q=4, description=description)
-                q1_raw = chat_text_only(q1_prompt, temperature=0.8, max_tokens=2048)
-                q1_pairs = extract_json_array(q1_raw)
-
-                if q1_pairs:
-                    for pair in q1_pairs:
-                        q1_record = {
-                            "messages": [
-                                {"role": "user", "content": f"<image>\n{pair['question']}"},
-                                {"role": "assistant", "content": pair["answer"]},
-                            ],
-                            "images": [img_path],
-                        }
-                        f_q1.write(json.dumps(q1_record, ensure_ascii=False) + "\n")
-                    f_q1.flush()
-                else:
-                    print(f"\n[Q1解析失败] {Path(img_path).name}: {q1_raw[:200]}")
-
-                # Step 3: 基于描述生成 Q2（具体关系/计数问答）
-                q2_prompt = Q2_GEN_PROMPT.format(num_q=5, description=description)
-                q2_raw = chat_text_only(q2_prompt, temperature=0.8, max_tokens=2048)
-                q2_pairs = extract_json_array(q2_raw)
-
-                if q2_pairs:
-                    for pair in q2_pairs:
-                        q2_record = {
-                            "messages": [
-                                {"role": "user", "content": f"<image>\n{pair['question']}"},
-                                {"role": "assistant", "content": pair["answer"]},
-                            ],
-                            "images": [img_path],
-                        }
-                        f_q2.write(json.dumps(q2_record, ensure_ascii=False) + "\n")
-                    f_q2.flush()
-                else:
-                    print(f"\n[Q2解析失败] {Path(img_path).name}: {q2_raw[:200]}")
-
-            except KeyboardInterrupt:
-                print(f"\n用户中断。")
-                return
-            except Exception as e:
-                print(f"\n[错误] {Path(img_path).name}: {e}")
-                fail_list.append(img_path)
+        files = {"desc": f_desc, "q1": f_q1, "q2": f_q2}
+        with tqdm(total=len(remaining), desc="生成双尺度描述+VQA") as pbar:
+            await asyncio.gather(*[
+                process_image(img_path, files, locks, fail_list, sem, pbar)
+                for img_path in remaining
+            ])
 
     # ---- 统计 ----
     print("\n" + "=" * 60)
@@ -527,4 +539,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

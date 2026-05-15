@@ -1,14 +1,16 @@
+import asyncio
 import base64
 import json
 import random
 from pathlib import Path
 from collections import defaultdict
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 from tqdm import tqdm
 
-# ==================== 配置 ====================
-client = OpenAI(api_key="EMPTY", base_url="http://localhost:8001/v1")
+CONCURRENCY = 10
+
+client = AsyncOpenAI(api_key="EMPTY", base_url="http://localhost:8001/v1")
 model_name = "Qwen/Qwen3-VL-32B-Instruct"
 
 DATASET_ROOT = "/home/charles/mycode/sft+rl/dataset"
@@ -193,10 +195,8 @@ def build_ebd_pairs(root_path):
         img_dir = event_dir / "images"
         if not img_dir.exists():
             continue
-        # 按 ID 分组
         id_to_paths = defaultdict(dict)
         for img_path in img_dir.glob("*"):
-            # 格式: {EVENT}_{ID}_{pre/post}_disaster.{ext}
             stem = img_path.stem
             parts = stem.rsplit("_", 2)
             if len(parts) < 3:
@@ -259,16 +259,69 @@ def build_second_pairs(root_path):
     return pairs
 
 
-# ==================== 主程序 ====================
+# ==================== 异步处理 ====================
 
 
-def process_dataset(name, pairs, teacher_prompt_template, user_instructions, output_file, has_event=False):
-    """通用的数据集处理函数。pairs 在传入前已经完成采样。
-    支持断点续传：启动时加载已有输出文件，跳过已处理的记录。
-    """
+async def process_pair(task, teacher_prompt_template, user_instructions, has_event,
+                       file_lock, f_out, fail_list, sem, pbar):
+    pre_path = str(task["pre"])
+    try:
+        async with sem:
+            b64_pre = encode_image(task["pre"])
+            b64_post = encode_image(task["post"])
+
+            teacher_prompt = teacher_prompt_template.format(event=task["event"]) if has_event else teacher_prompt_template
+
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": teacher_prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_pre}"}},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_post}"}},
+                        ],
+                    }
+                ],
+                max_tokens=2048,
+                temperature=0.7,
+            )
+
+        answer = response.choices[0].message.content
+        record = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"<image>\n<image>\n{random.choice(user_instructions)}",
+                },
+                {
+                    "role": "assistant",
+                    "content": answer,
+                },
+            ],
+            "images": [
+                str(task["pre"].resolve()),
+                str(task["post"].resolve()),
+            ],
+        }
+
+        async with file_lock:
+            f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f_out.flush()
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"\n[错误] {Path(pre_path).stem}: {e}")
+        fail_list.append(pre_path)
+    finally:
+        pbar.update(1)
+
+
+async def process_dataset(name, pairs, teacher_prompt_template, user_instructions, output_file, has_event=False):
     output_path = Path(output_file)
 
-    # 加载已完成记录
     done = set()
     if output_path.exists():
         with open(output_path, "r", encoding="utf-8") as f:
@@ -282,7 +335,6 @@ def process_dataset(name, pairs, teacher_prompt_template, user_instructions, out
                 except Exception:
                     pass
 
-    # 过滤出待处理的 pairs
     remaining = [t for t in pairs if str(t["pre"]) not in done]
     skipped = len(pairs) - len(remaining)
 
@@ -297,76 +349,24 @@ def process_dataset(name, pairs, teacher_prompt_template, user_instructions, out
         return
 
     fail_list = []
+    sem = asyncio.Semaphore(CONCURRENCY)
+    file_lock = asyncio.Lock()
 
     with open(output_path, "a", encoding="utf-8") as f_out:
-        pbar = tqdm(remaining, desc=f"{name}")
-        for task in pbar:
-            pre_path = str(task["pre"])
-            pbar.set_postfix_str(Path(pre_path).stem)
-
-            try:
-                b64_pre = encode_image(task["pre"])
-                b64_post = encode_image(task["post"])
-
-                if has_event:
-                    teacher_prompt = teacher_prompt_template.format(event=task["event"])
-                else:
-                    teacher_prompt = teacher_prompt_template
-
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": teacher_prompt},
-                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_pre}"}},
-                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_post}"}},
-                            ],
-                        }
-                    ],
-                    max_tokens=2048,
-                    temperature=0.7,
-                )
-
-                answer = response.choices[0].message.content
-
-                record = {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": f"<image>\n<image>\n{random.choice(user_instructions)}",
-                        },
-                        {
-                            "role": "assistant",
-                            "content": answer,
-                        },
-                    ],
-                    "images": [
-                        str(task["pre"].resolve()),
-                        str(task["post"].resolve()),
-                    ],
-                }
-
-                f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
-                f_out.flush()
-
-            except KeyboardInterrupt:
-                print(f"\n用户中断，已处理 {skipped + pbar.n} 条。")
-                if fail_list:
-                    print(f"本次失败 {len(fail_list)} 条，下次运行会自动重试。")
-                return
-            except Exception as e:
-                print(f"\n[错误] {name} | {Path(pre_path).stem}: {e}")
-                fail_list.append(pre_path)
+        with tqdm(total=len(remaining), desc=name) as pbar:
+            await asyncio.gather(*[
+                process_pair(task, teacher_prompt_template, user_instructions, has_event,
+                             file_lock, f_out, fail_list, sem, pbar)
+                for task in remaining
+            ])
 
     if fail_list:
-        print(f"\n{name} 处理完成，但有 {len(fail_list)} 条失败（已跳过），下次运行会自动重试：")
+        print(f"\n{name} 处理完成，但有 {len(fail_list)} 条失败（下次运行会自动重试）：")
         for fp in fail_list:
             print(f"  - {fp}")
 
 
-def main():
+async def main():
     # EBD: 每种灾害类型取前 200 对
     ebd_all = build_ebd_pairs(DATASET_ROOT + "/EBD")
     ebd_by_event = defaultdict(list)
@@ -377,7 +377,7 @@ def main():
         taken = pairs[:EBD_PER_EVENT]
         print(f"  EBD | {event}: {len(pairs)} 对可用, 取前 {len(taken)} 对")
         ebd_pairs.extend(taken)
-    process_dataset(
+    await process_dataset(
         name="EBD",
         pairs=ebd_pairs,
         teacher_prompt_template=EBD_TEACHER_PROMPT,
@@ -390,7 +390,7 @@ def main():
     levir_all = build_levir_pairs(DATASET_ROOT + "/LEVIR-CD+")
     levir_pairs = levir_all[:LEVIR_TAKE]
     print(f"  LEVIR-CD+: {len(levir_all)} 对可用, 取前 {len(levir_pairs)} 对")
-    process_dataset(
+    await process_dataset(
         name="LEVIR-CD+",
         pairs=levir_pairs,
         teacher_prompt_template=LEVIR_TEACHER_PROMPT,
@@ -403,7 +403,7 @@ def main():
     second_all = build_second_pairs(DATASET_ROOT + "/SECOND")
     second_pairs = second_all[:SECOND_TAKE]
     print(f"  SECOND: {len(second_all)} 对可用, 取前 {len(second_pairs)} 对")
-    process_dataset(
+    await process_dataset(
         name="SECOND",
         pairs=second_pairs,
         teacher_prompt_template=SECOND_TEACHER_PROMPT,
@@ -423,4 +423,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
