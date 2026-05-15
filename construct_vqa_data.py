@@ -245,10 +245,10 @@ def _build_ebd_pairs(root_path):
         id_to_paths = defaultdict(dict)
         for img_path in img_dir.glob("*"):
             stem = img_path.stem
-            parts = stem.rsplit("_", 2)
-            if len(parts) < 3:
+            parts = stem.rsplit("_", 3)
+            if len(parts) < 4:
                 continue
-            img_id = parts[-2]
+            img_id = parts[-3]
             if "pre" in stem:
                 id_to_paths[img_id]["pre"] = img_path
             elif "post" in stem:

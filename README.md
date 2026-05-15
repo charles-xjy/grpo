@@ -8,7 +8,8 @@
 grpo/
 ├── construct_sft_data.py   # 构建变化检测 CoT-SFT 数据
 ├── construct_vqa_data.py   # 构建单图双尺度描述与 VQA 数据
-└── plugin.py               # GRPO 训练的 LLM-as-Judge 奖励函数插件
+├── plugin.py               # GRPO 训练的 LLM-as-Judge 奖励函数插件
+└── test_vllm.py            # 测试 vLLM 多模态接口的单次请求脚本
 ```
 
 ## 数据集
@@ -17,7 +18,7 @@ grpo/
 
 | 数据集 | 场景类型 | 目录结构 |
 |--------|----------|----------|
-| **EBD** | 地质灾害（灾前/灾后对比） | `EBD/{event}/images/{id}_{pre/post}_disaster.*` |
+| **EBD** | 地质灾害（灾前/灾后对比） | `EBD/{EVENT}/images/{EVENT}_{ID}_{pre\|post}_disaster.*` |
 | **LEVIR-CD+** | 城市建筑物变化检测 | `LEVIR-CD+/{train\|test}/{A\|B}/*.png` |
 | **SECOND** | 多类地表覆盖变化检测 | `SECOND/{train\|test}/{im1\|im2}/*.png` |
 
@@ -79,21 +80,76 @@ vqa_data/
 pip install openai tqdm
 ```
 
-教师模型需在本地以 OpenAI 兼容接口方式部署（默认端口 `8001`），例如使用 swift：
+## vLLM 部署
+
+教师模型需在本地以 OpenAI 兼容接口方式部署（默认端口 `8001`）：
+
+```bash
+vllm serve Qwen/Qwen3-VL-32B-Instruct \
+  --tensor-parallel-size 2 \
+  --port 8001 \
+  --no-enable-chunked-prefill   # Qwen3-VL 必须加，否则多图并发会触发 deepstack buffer 溢出
+```
+
+或使用 swift：
 
 ```bash
 swift deploy --model Qwen/Qwen3-VL-32B-Instruct --port 8001 --infer_backend vllm
 ```
 
+## 并行加速机制
+
+两个数据构建脚本均针对大规模数据生成进行了并行优化，是本项目的核心亮点。
+
+### construct_sft_data.py — 多线程并行
+
+基于 `ThreadPoolExecutor` + `as_completed`，所有图像对任务一次性提交入队，始终保持 `--concurrency` 个线程同时向 vLLM 发送请求。哪个请求先返回就先写入文件，不阻塞其他线程。
+
+```
+提交阶段：1000 个任务全部入队（瞬间完成）
+          ↓
+执行阶段：Thread-1 ──── 请求A ──── 写入
+          Thread-2 ──── 请求B ──── 写入     ← 始终保持 N 个并发
+          Thread-3 ──── 请求C ──── 写入
+          Thread-4 ──── 请求D ──── 写入
+                   请求D完成 → Thread-4 立即取下一个任务
+```
+
+文件写入通过 `threading.Lock` 保证线程安全。
+
+### construct_vqa_data.py — 异步并行（每图 3 路并发）
+
+基于 `asyncio` + `Semaphore`，每张图像内部也有并行：生成双尺度描述后，Q1（开放式问答）和 Q2（关系/计数问答）两路纯文本请求通过 `asyncio.gather` 同时发出，单张图像总耗时约等于"描述生成 + max(Q1, Q2)"而非三者之和。
+
+```
+每张图像的处理流程：
+
+Step 1 │ 双尺度描述（含图，占 1 槽）
+       ↓ 描述生成完成
+Step 2 │ Q1 生成（纯文本）┐
+       │ Q2 生成（纯文本）┘← asyncio.gather 并行，各占 1 槽
+       ↓ 两路同时完成
+       写入三个输出文件
+```
+
+全局并发上限由 `asyncio.Semaphore(concurrency)` 统一控制，所有图像的所有子任务共享这个槽位池。
+
 ## 运行数据构建脚本
 
 ```bash
 # 构建变化检测 SFT 数据
-python construct_sft_data.py
+python construct_sft_data.py [--base-url URL] [--concurrency N] [--retries N]
 
 # 构建单图描述与 VQA 数据
-python construct_vqa_data.py
+python construct_vqa_data.py [--base-url URL] [--concurrency N] [--retries N]
 ```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--model` | 自动探测 | 指定模型名，也可通过 `$VLLM_MODEL` 环境变量设置 |
+| `--base-url` | `http://localhost:8001` | vLLM 服务地址 |
+| `--concurrency` | `4` | 并行请求数 |
+| `--retries` | `3` | 单条记录失败后最大重试次数 |
 
 ## GRPO 奖励函数（plugin.py）
 
