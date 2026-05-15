@@ -333,7 +333,9 @@ def encode_image(image_path):
 
 
 def collect_unique_images(root_path, dataset_type):
-    """从各数据集中收集唯一图像路径（已 resolve，与 get_cot_image_set 一致）。"""
+    """从各数据集中收集 post 侧图像路径（已 resolve，与 get_cot_image_set 一致）。
+    只取 post 侧避免 pre/post 同场景重复：EBD 取 post_disaster，LEVIR 取 B，SECOND 取 im2。
+    """
     root = Path(root_path)
     images = set()
 
@@ -346,16 +348,24 @@ def collect_unique_images(root_path, dataset_type):
                 continue
             for img_path in img_dir.glob("*"):
                 if img_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".tif", ".tiff"):
-                    images.add(str(img_path.resolve()))
-    elif dataset_type in ("levir", "second"):
-        for split in ["train", "test"]:
-            for subdir in ["A", "B"] if dataset_type == "levir" else ["im1", "im2"]:
-                d = root / split / subdir
-                if not d.exists():
-                    continue
-                for img_path in d.iterdir():
-                    if img_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".tif", ".tiff"):
+                    if "post" in img_path.stem:
                         images.add(str(img_path.resolve()))
+    elif dataset_type == "levir":
+        for split in ["train", "test"]:
+            d = root / split / "B"
+            if not d.exists():
+                continue
+            for img_path in d.iterdir():
+                if img_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".tif", ".tiff"):
+                    images.add(str(img_path.resolve()))
+    elif dataset_type == "second":
+        for split in ["train", "test"]:
+            d = root / split / "im2"
+            if not d.exists():
+                continue
+            for img_path in d.iterdir():
+                if img_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".tif", ".tiff"):
+                    images.add(str(img_path.resolve()))
 
     return sorted(images)
 
