@@ -16,12 +16,8 @@ folder_name = Path(dataset_root).name
 current_time = datetime.now().strftime("%m.%d.%H:%M")
 output_file = f"{current_time}_{folder_name}_sft.jsonl"
 
-# 【修改点】在 Prompt 中预留一个 {event} 占位符，告诉模型已知的灾害背景
-prompt_template = """
-    # Context
-    本次分析的灾害事件类型为：{event}。
-
-    # Role
+# 原来会填 {event} 告诉模型灾害类型，现在去掉让模型自己判断
+prompt_template = """# Role
     你是一位资深的遥感地质专家与防灾减灾顾问。请对比分析提供的两张影像（图1灾前，图2灾后）。
 
     # Task
@@ -116,8 +112,7 @@ def main():
                 base64_pre = encode_image(task['pre'])
                 base64_post = encode_image(task['post'])
 
-                # 【修改点】动态填充 Prompt，将当前任务的 event 传入
-                formatted_prompt = prompt_template.format(event=event)
+                formatted_prompt = prompt_template
 
                 response = client.chat.completions.create(
                     model=model_name,

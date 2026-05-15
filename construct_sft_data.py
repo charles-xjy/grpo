@@ -21,10 +21,7 @@ SECOND_TAKE = 2000         # SECOND 按顺序取前 2000 对
 
 # ==================== 教师模型 Prompt（详细，发给教师模型） ====================
 
-EBD_TEACHER_PROMPT = """# Context
-本次分析的灾害事件类型为：{event}。
-
-# Role
+EBD_TEACHER_PROMPT = """# Role
 你是一位资深的遥感地质专家与防灾减灾顾问。请对比分析提供的两张影像（图1灾前，图2灾后）。
 
 # Task
@@ -262,7 +259,7 @@ def build_second_pairs(root_path):
 # ==================== 主程序 ====================
 
 
-def process_dataset(name, pairs, teacher_prompt_template, user_instructions, output_file, has_event=False):
+def process_dataset(name, pairs, teacher_prompt_template, user_instructions, output_file):
     """通用的数据集处理函数。pairs 在传入前已经完成采样。
     支持断点续传：启动时加载已有输出文件，跳过已处理的记录。
     """
@@ -308,10 +305,7 @@ def process_dataset(name, pairs, teacher_prompt_template, user_instructions, out
                 b64_pre = encode_image(task["pre"])
                 b64_post = encode_image(task["post"])
 
-                if has_event:
-                    teacher_prompt = teacher_prompt_template.format(event=task["event"])
-                else:
-                    teacher_prompt = teacher_prompt_template
+                teacher_prompt = teacher_prompt_template
 
                 response = client.chat.completions.create(
                     model=model_name,
@@ -383,7 +377,6 @@ def main():
         teacher_prompt_template=EBD_TEACHER_PROMPT,
         user_instructions=EBD_USER_INSTRUCTIONS,
         output_file=str(OUTPUT_DIR / "EBD_sft.jsonl"),
-        has_event=True,
     )
 
     # LEVIR-CD+: 按顺序取前 LEVIR_TAKE 对
@@ -396,7 +389,6 @@ def main():
         teacher_prompt_template=LEVIR_TEACHER_PROMPT,
         user_instructions=LEVIR_USER_INSTRUCTIONS,
         output_file=str(OUTPUT_DIR / "LEVIR-CD+_sft.jsonl"),
-        has_event=False,
     )
 
     # SECOND: 按顺序取前 2000 对
@@ -409,7 +401,6 @@ def main():
         teacher_prompt_template=SECOND_TEACHER_PROMPT,
         user_instructions=SECOND_USER_INSTRUCTIONS,
         output_file=str(OUTPUT_DIR / "SECOND_sft.jsonl"),
-        has_event=False,
     )
 
     print("\n" + "=" * 60)
