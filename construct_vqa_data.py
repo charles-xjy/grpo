@@ -11,22 +11,56 @@
   - vqa_specific.jsonl      : 图像 → Q2 具体关系/计数问答（SFT 格式）
 """
 
+import argparse
 import asyncio
 import base64
 import json
+import os
 import random
 import re
+import sys
+import traceback
 from collections import defaultdict
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 from openai import AsyncOpenAI
 from tqdm import tqdm
 
-# ==================== 配置 ====================
-client = AsyncOpenAI(api_key="EMPTY", base_url="http://localhost:8001/v1")
-model_name = "Qwen/Qwen3-VL-32B-Instruct"
 
-CONCURRENCY = 10
+def _fetch_available_model(base_url: str) -> str:
+    req = Request(f"{base_url}/v1/models", headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        models = data.get("data", [])
+        if models:
+            return models[0]["id"]
+    except Exception:
+        pass
+    return ""
+
+
+# ==================== 配置 ====================
+parser = argparse.ArgumentParser(description="Construct VQA data from teacher model")
+parser.add_argument("--model", default=None,
+                    help="Model name (default: $VLLM_MODEL or auto-detect from server)")
+parser.add_argument("--base-url", default="http://localhost:8001",
+                    help="vLLM server base URL (default: http://localhost:8001)")
+parser.add_argument("--concurrency", type=int, default=4,
+                    help="Number of parallel requests to vLLM (default: 4)")
+parser.add_argument("--retries", type=int, default=3,
+                    help="Max retries per API call on failure (default: 3)")
+args = parser.parse_args()
+
+base_url = args.base_url
+model_name = args.model or os.getenv("VLLM_MODEL") or _fetch_available_model(base_url)
+if not model_name:
+    print("FAIL: unable to determine model. Pass --model or set $VLLM_MODEL.")
+    sys.exit(1)
+print(f"Using model: {model_name}")
+
+client = AsyncOpenAI(api_key="EMPTY", base_url=f"{base_url}/v1")
 
 DATASET_ROOT = "/home/charles/mycode/sft+rl/dataset"
 OUTPUT_DIR = Path("/home/charles/mycode/grpo/vqa_data")
@@ -355,33 +389,53 @@ def extract_json_array(text):
 # ==================== 异步 API 调用 ====================
 
 
+async def _call_with_retry(coro_fn, desc=""):
+    """带重试的异步 API 调用。"""
+    for attempt in range(args.retries + 1):
+        try:
+            return await coro_fn()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if attempt < args.retries:
+                await asyncio.sleep(2 ** attempt)
+    raise RuntimeError(f"API call failed after {args.retries} retries: {desc}")
+
+
 async def chat_with_image_async(prompt, image_path, temperature=0.7, max_tokens=2048):
     b64 = encode_image(image_path)
-    response = await client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                ],
-            }
-        ],
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
-    return response.choices[0].message.content
+
+    async def _call():
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    ],
+                }
+            ],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return response.choices[0].message.content
+
+    return await _call_with_retry(_call, Path(image_path).stem)
 
 
 async def chat_text_only_async(prompt, temperature=0.8, max_tokens=2048):
-    response = await client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
-    return response.choices[0].message.content
+    async def _call():
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return response.choices[0].message.content
+
+    return await _call_with_retry(_call, prompt[:80])
 
 
 # ==================== 主处理逻辑 ====================
@@ -507,7 +561,7 @@ async def main():
         return
 
     fail_list = []
-    sem = asyncio.Semaphore(CONCURRENCY)
+    sem = asyncio.Semaphore(args.concurrency)
     locks = {
         "desc": asyncio.Lock(),
         "q1": asyncio.Lock(),

@@ -1,15 +1,46 @@
+import argparse
 import base64
 import json
+import os
 import re
+import sys
 from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
 from openai import OpenAI
 from collections import defaultdict
+from urllib.request import Request, urlopen
+
+
+def _fetch_available_model(base_url: str) -> str:
+    req = Request(f"{base_url}/v1/models", headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        models = data.get("data", [])
+        if models:
+            return models[0]["id"]
+    except Exception:
+        pass
+    return ""
+
 
 # ================= 1. 配置部分 =================
-client = OpenAI(api_key="EMPTY", base_url="http://localhost:8001/v1")
-model_name = "Qwen/Qwen3-VL-32B-Instruct"
+parser = argparse.ArgumentParser(description="Create EBD SFT data from teacher model")
+parser.add_argument("--model", default=None,
+                    help="Model name (default: $VLLM_MODEL or auto-detect from server)")
+parser.add_argument("--base-url", default="http://localhost:8001",
+                    help="vLLM server base URL (default: http://localhost:8001)")
+args = parser.parse_args()
+
+base_url = args.base_url
+model_name = args.model or os.getenv("VLLM_MODEL") or _fetch_available_model(base_url)
+if not model_name:
+    print("FAIL: unable to determine model. Pass --model or set $VLLM_MODEL.")
+    sys.exit(1)
+print(f"Using model: {model_name}")
+
+client = OpenAI(api_key="EMPTY", base_url=f"{base_url}/v1")
 
 dataset_root = "/home/charles/mycode/sft+rl/dataset/EBD"
 folder_name = Path(dataset_root).name

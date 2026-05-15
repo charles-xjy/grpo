@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Test vLLM multimodal — EBD dataset record 1."""
 
+import argparse
 import base64
 import json
+import os
 import sys
 import time
 from urllib.request import Request, urlopen
@@ -43,9 +45,36 @@ EBD_TEACHER_PROMPT = """# Role
 
 
 
+def _fetch_available_model(base_url: str) -> str:
+    """Query /v1/models to get the first available model name."""
+    req = Request(f"{base_url}/v1/models", headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        models = data.get("data", [])
+        if models:
+            return models[0]["id"]
+    except Exception:
+        pass
+    return ""
+
+
 def main():
-    base_url = "http://localhost:8001"
-    model = "Qwen/Qwen3.5-27B"
+    parser = argparse.ArgumentParser(description="Test vLLM multimodal chat completions")
+    parser.add_argument("--model", default=None,
+                        help="Model name (default: $VLLM_MODEL or auto-detect from server)")
+    parser.add_argument("--base-url", default="http://localhost:8001",
+                        help="vLLM server base URL (default: http://localhost:8001)")
+    args = parser.parse_args()
+
+    base_url = args.base_url
+
+    # Priority: CLI arg > env var > auto-detect from server
+    model = args.model or os.getenv("VLLM_MODEL") or _fetch_available_model(base_url)
+    if not model:
+        print("FAIL: unable to determine model. Pass --model or set $VLLM_MODEL.")
+        sys.exit(1)
+    print(f"Using model: {model}")
 
     img1 = "/home/charles/mycode/sft+rl/dataset/EBD/EARTHQUAKE-TURKEY/images/EARTHQUAKE-TURKEY_002441_pre_disaster.png"
     img2 = "/home/charles/mycode/sft+rl/dataset/EBD/EARTHQUAKE-TURKEY/images/EARTHQUAKE-TURKEY_002441_post_disaster.png"

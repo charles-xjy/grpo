@@ -1,23 +1,62 @@
+import argparse
 import base64
 import json
+import os
 import random
+import sys
+import threading
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from collections import defaultdict
+from urllib.request import Request, urlopen
 
 from openai import OpenAI
 from tqdm import tqdm
 
+
+def _fetch_available_model(base_url: str) -> str:
+    req = Request(f"{base_url}/v1/models", headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        models = data.get("data", [])
+        if models:
+            return models[0]["id"]
+    except Exception:
+        pass
+    return ""
+
+
 # ==================== 配置 ====================
-client = OpenAI(api_key="EMPTY", base_url="http://localhost:8001/v1")
-model_name = "Qwen/Qwen3-VL-32B-Instruct"
+parser = argparse.ArgumentParser(description="Construct SFT data from teacher model")
+parser.add_argument("--model", default=None,
+                    help="Model name (default: $VLLM_MODEL or auto-detect from server)")
+parser.add_argument("--base-url", default="http://localhost:8001",
+                    help="vLLM server base URL (default: http://localhost:8001)")
+parser.add_argument("--concurrency", type=int, default=4,
+                    help="Number of parallel requests to vLLM (default: 4)")
+parser.add_argument("--retries", type=int, default=3,
+                    help="Max retries per record on failure (default: 3)")
+args = parser.parse_args()
+
+base_url = args.base_url
+model_name = args.model or os.getenv("VLLM_MODEL") or _fetch_available_model(base_url)
+if not model_name:
+    print("FAIL: unable to determine model. Pass --model or set $VLLM_MODEL.")
+    sys.exit(1)
+print(f"Using model: {model_name}")
+
+client = OpenAI(api_key="EMPTY", base_url=f"{base_url}/v1")
 
 DATASET_ROOT = "/home/charles/mycode/sft+rl/dataset"
 OUTPUT_DIR = Path("/home/charles/mycode/grpo")
 
 # 每个数据集的采样数量
-EBD_PER_EVENT = 200       # EBD 每种灾害类型抽 200 对
-LEVIR_TAKE = 500           # LEVIR-CD+ 按顺序取前 500 对
-SECOND_TAKE = 2000         # SECOND 按顺序取前 2000 对
+EBD_PER_EVENT = 200  # EBD 每种灾害类型抽 200 对
+LEVIR_TAKE = 500  # LEVIR-CD+ 按顺序取前 500 对
+SECOND_TAKE = 2000  # SECOND 按顺序取前 2000 对
 
 # ==================== 教师模型 Prompt（详细，发给教师模型） ====================
 
@@ -171,6 +210,7 @@ SECOND_USER_INSTRUCTIONS = [
     "分析这两张前后时相的遥感影像，评估地表覆盖变化及其生态影响。",
 ]
 
+
 # ==================== 工具函数 ====================
 
 
@@ -195,10 +235,10 @@ def build_ebd_pairs(root_path):
         for img_path in img_dir.glob("*"):
             # 格式: {EVENT}_{ID}_{pre/post}_disaster.{ext}
             stem = img_path.stem
-            parts = stem.rsplit("_", 2)
-            if len(parts) < 3:
+            parts = stem.rsplit("_", 3)
+            if len(parts) < 4:
                 continue
-            img_id = parts[-2]
+            img_id = parts[-3]
             if "pre" in stem:
                 id_to_paths[img_id]["pre"] = img_path
             elif "post" in stem:
@@ -259,10 +299,57 @@ def build_second_pairs(root_path):
 # ==================== 主程序 ====================
 
 
+def _process_single(task, teacher_prompt_template, user_instructions):
+    """处理单条记录，带重试逻辑。成功返回 record，失败返回 None。"""
+    pre_path = str(task["pre"])
+    b64_pre = encode_image(task["pre"])
+    b64_post = encode_image(task["post"])
+
+    max_retries = args.retries
+    last_error = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": teacher_prompt_template},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_pre}"}},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_post}"}},
+                        ],
+                    }
+                ],
+                max_tokens=2048,
+                temperature=0.7,
+            )
+
+            answer = response.choices[0].message.content
+            return {
+                "messages": [
+                    {"role": "user", "content": f"<image>\n<image>\n{random.choice(user_instructions)}"},
+                    {"role": "assistant", "content": answer},
+                ],
+                "images": [str(task["pre"].resolve()), str(task["post"].resolve())],
+            }
+
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                time.sleep(wait)
+
+    stem = Path(pre_path).stem
+    tqdm.write(f"\n[FAIL {stem}] retries exhausted: {last_error}")
+    return None
+
+
 def process_dataset(name, pairs, teacher_prompt_template, user_instructions, output_file):
-    """通用的数据集处理函数。pairs 在传入前已经完成采样。
-    支持断点续传：启动时加载已有输出文件，跳过已处理的记录。
-    """
+    """通用数据集处理函数，并行请求 vLLM，带重试和断点续传。"""
     output_path = Path(output_file)
 
     # 加载已完成记录
@@ -283,85 +370,72 @@ def process_dataset(name, pairs, teacher_prompt_template, user_instructions, out
     remaining = [t for t in pairs if str(t["pre"]) not in done]
     skipped = len(pairs) - len(remaining)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"处理 {name}")
     print(f"  总计: {len(pairs)} 对 | 已完成: {skipped} | 待处理: {len(remaining)}")
     print(f"  输出: {output_file}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     if not remaining:
         print("  全部已完成，跳过。")
         return
 
     fail_list = []
+    write_lock = threading.Lock()
+    running = True
 
     with open(output_path, "a", encoding="utf-8") as f_out:
-        pbar = tqdm(remaining, desc=f"{name}")
-        for task in pbar:
-            pre_path = str(task["pre"])
-            pbar.set_postfix_str(Path(pre_path).stem)
-
-            try:
-                b64_pre = encode_image(task["pre"])
-                b64_post = encode_image(task["post"])
-
-                teacher_prompt = teacher_prompt_template
-
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": teacher_prompt},
-                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_pre}"}},
-                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_post}"}},
-                            ],
-                        }
-                    ],
-                    max_tokens=2048,
-                    temperature=0.7,
-                )
-
-                answer = response.choices[0].message.content
-
-                record = {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": f"<image>\n<image>\n{random.choice(user_instructions)}",
-                        },
-                        {
-                            "role": "assistant",
-                            "content": answer,
-                        },
-                    ],
-                    "images": [
-                        str(task["pre"].resolve()),
-                        str(task["post"].resolve()),
-                    ],
+        with tqdm(total=len(remaining), desc=f"{name}") as pbar:
+            with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+                futures = {
+                    executor.submit(_process_single, task, teacher_prompt_template, user_instructions): task
+                    for task in remaining
                 }
 
-                f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
-                f_out.flush()
+                try:
+                    for future in as_completed(futures):
+                        task = futures[future]
+                        try:
+                            record = future.result()
+                        except Exception as e:
+                            if not running:
+                                break
+                            stem = Path(task["pre"]).stem
+                            tqdm.write(f"\n[错误] {name} | {stem}: {e}")
+                            fail_list.append(str(task["pre"]))
+                            pbar.update(1)
+                            continue
 
-            except KeyboardInterrupt:
-                print(f"\n用户中断，已处理 {skipped + pbar.n} 条。")
-                if fail_list:
-                    print(f"本次失败 {len(fail_list)} 条，下次运行会自动重试。")
-                return
-            except Exception as e:
-                print(f"\n[错误] {name} | {Path(pre_path).stem}: {e}")
-                fail_list.append(pre_path)
+                        if record is not None:
+                            with write_lock:
+                                f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                                f_out.flush()
+                        else:
+                            fail_list.append(str(task["pre"]))
+                        pbar.update(1)
 
+                except KeyboardInterrupt:
+                    running = False
+                    remaining_count = sum(1 for f in futures if not f.done())
+                    print(f"\n用户中断，取消剩余 {remaining_count} 个任务...")
+                    for f in futures:
+                        f.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    if fail_list:
+                        print(f"本次失败 {len(fail_list)} 条，下次运行会自动重试。")
+                    return
+
+    done_count = len(remaining) - len(fail_list) - pbar.n + pbar.total
     if fail_list:
-        print(f"\n{name} 处理完成，但有 {len(fail_list)} 条失败（已跳过），下次运行会自动重试：")
-        for fp in fail_list:
+        print(f"\n{name} 处理完成，成功 {pbar.n - len(fail_list)} 条，失败 {len(fail_list)} 条（下次运行会自动重试）：")
+        for fp in fail_list[:10]:
             print(f"  - {fp}")
+        if len(fail_list) > 10:
+            print(f"  ... 及其他 {len(fail_list) - 10} 条")
 
 
 def main():
-    # EBD: 每种灾害类型取前 200 对
+    # ── 构建所有数据集并打印汇总 ──
     ebd_all = build_ebd_pairs(DATASET_ROOT + "/EBD")
     ebd_by_event = defaultdict(list)
     for p in ebd_all:
@@ -369,8 +443,22 @@ def main():
     ebd_pairs = []
     for event, pairs in sorted(ebd_by_event.items()):
         taken = pairs[:EBD_PER_EVENT]
-        print(f"  EBD | {event}: {len(pairs)} 对可用, 取前 {len(taken)} 对")
         ebd_pairs.extend(taken)
+
+    levir_all = build_levir_pairs(DATASET_ROOT + "/LEVIR-CD+")
+    levir_pairs = levir_all[:LEVIR_TAKE]
+
+    second_all = build_second_pairs(DATASET_ROOT + "/SECOND")
+    second_pairs = second_all[:SECOND_TAKE]
+
+    print("数据集统计：")
+    for event, pairs in sorted(ebd_by_event.items()):
+        print(f"  EBD | {event}: {len(pairs)} 对可用, 取前 {min(len(pairs), EBD_PER_EVENT)} 对")
+    print(f"  LEVIR-CD+: {len(levir_all)} 对可用, 取前 {len(levir_pairs)} 对")
+    print(f"  SECOND:    {len(second_all)} 对可用, 取前 {len(second_pairs)} 对")
+    print(f"  合计待处理: {len(ebd_pairs) + len(levir_pairs) + len(second_pairs)} 对")
+
+    # ── 依次处理 ──
     process_dataset(
         name="EBD",
         pairs=ebd_pairs,
@@ -378,11 +466,6 @@ def main():
         user_instructions=EBD_USER_INSTRUCTIONS,
         output_file=str(OUTPUT_DIR / "EBD_sft.jsonl"),
     )
-
-    # LEVIR-CD+: 按顺序取前 LEVIR_TAKE 对
-    levir_all = build_levir_pairs(DATASET_ROOT + "/LEVIR-CD+")
-    levir_pairs = levir_all[:LEVIR_TAKE]
-    print(f"  LEVIR-CD+: {len(levir_all)} 对可用, 取前 {len(levir_pairs)} 对")
     process_dataset(
         name="LEVIR-CD+",
         pairs=levir_pairs,
@@ -390,11 +473,6 @@ def main():
         user_instructions=LEVIR_USER_INSTRUCTIONS,
         output_file=str(OUTPUT_DIR / "LEVIR-CD+_sft.jsonl"),
     )
-
-    # SECOND: 按顺序取前 2000 对
-    second_all = build_second_pairs(DATASET_ROOT + "/SECOND")
-    second_pairs = second_all[:SECOND_TAKE]
-    print(f"  SECOND: {len(second_all)} 对可用, 取前 {len(second_pairs)} 对")
     process_dataset(
         name="SECOND",
         pairs=second_pairs,
