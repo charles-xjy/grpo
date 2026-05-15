@@ -69,9 +69,9 @@ OUTPUT_DIR = Path("/home/charles/mycode/grpo/vqa_data")
 MAX_PER_DATASET = 3000
 
 # ==================== CoT 分配规则（与 construct_sft_data.py 保持一致） ====================
-EBD_PER_EVENT = 200       # EBD 每种灾害类型前 200 对归 CoT
-LEVIR_TAKE = 500           # LEVIR-CD+ 前 500 对归 CoT，剩余归 VQA
-SECOND_TAKE = 2000         # SECOND 前 2000 对归 CoT
+EBD_PER_EVENT = 200  # EBD 每种灾害类型前 200 对归 CoT
+LEVIR_TAKE = 500  # LEVIR-CD+ 前 500 对归 CoT，剩余归 VQA
+SECOND_TAKE = 2000  # SECOND 前 2000 对归 CoT
 
 # ==================== Prompt: 双尺度描述生成 ====================
 
@@ -542,7 +542,8 @@ async def main():
         imgs = collect_unique_images(ds_path, dtype)
         available = [p for p in imgs if p not in cot_images]
         sampled = available[:MAX_PER_DATASET]
-        print(f"  {ds_name}: {len(imgs)} 张, CoT占用 {len(imgs)-len(available)}, VQA可用 {len(available)}, 采样 {len(sampled)}")
+        print(
+            f"  {ds_name}: {len(imgs)} 张, CoT占用 {len(imgs) - len(available)}, VQA可用 {len(available)}, 采样 {len(sampled)}")
         all_images.extend(sampled)
 
     random.shuffle(all_images)
