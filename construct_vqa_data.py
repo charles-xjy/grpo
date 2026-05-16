@@ -300,7 +300,7 @@ def _build_second_pairs(root_path):
 
 
 def get_cot_image_set():
-    """返回 CoT 数据占用的图像路径集合（绝对路径字符串）。"""
+    """返回 CoT 数据占用的 post 侧图像路径集合（绝对路径字符串）。"""
     cot_images = set()
 
     ebd_all = _build_ebd_pairs(DATASET_ROOT + "/EBD")
@@ -309,16 +309,13 @@ def get_cot_image_set():
         ebd_by_event[p["event"]].append(p)
     for event, pairs in sorted(ebd_by_event.items()):
         for p in pairs[:EBD_PER_EVENT]:
-            cot_images.add(str(p["pre"].resolve()))
             cot_images.add(str(p["post"].resolve()))
 
     for p in _build_levir_pairs(DATASET_ROOT + "/LEVIR-CD+")[:LEVIR_TAKE]:
-        cot_images.add(str(p["pre"].resolve()))
         cot_images.add(str(p["post"].resolve()))
 
     second_all = _build_second_pairs(DATASET_ROOT + "/SECOND")
     for p in second_all[:SECOND_TAKE]:
-        cot_images.add(str(p["pre"].resolve()))
         cot_images.add(str(p["post"].resolve()))
 
     return cot_images
@@ -451,72 +448,114 @@ async def chat_text_only_async(prompt, temperature=0.8, max_tokens=2048):
 # ==================== 主处理逻辑 ====================
 
 
-async def process_image(img_path, files, locks, fail_list, sem, pbar):
+def _load_completed(filepath):
+    s = set()
+    if filepath.exists():
+        with open(filepath, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    s.add(rec["images"][0])
+                except Exception:
+                    pass
+    return s
+
+
+def _load_desc_map(filepath):
+    """加载 desc 文件，返回 {img_path: description} 映射。"""
+    desc_map = {}
+    if filepath.exists():
+        with open(filepath, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    desc_map[rec["images"][0]] = rec["messages"][1]["content"]
+                except Exception:
+                    pass
+    return desc_map
+
+
+async def process_desc(img_path, f_desc, lock, fail_list, sem, pbar):
     try:
-        # Step 1: 生成双尺度描述（需要图像，占 1 个并发槽）
         async with sem:
             description = await chat_with_image_async(DUAL_SCALE_PROMPT, img_path)
-
         if not description or len(description.strip()) < 50:
-            print(f"\n[跳过] {Path(img_path).name}: 描述过短")
+            tqdm.write(f"[跳过] {Path(img_path).name}: 描述过短")
             return
-
-        desc_record = {
+        record = {
             "messages": [
                 {"role": "user", "content": f"<image>\n{random.choice(DESC_USER_INSTRUCTIONS)}"},
                 {"role": "assistant", "content": description.strip()},
             ],
             "images": [img_path],
         }
-        async with locks["desc"]:
-            files["desc"].write(json.dumps(desc_record, ensure_ascii=False) + "\n")
-            files["desc"].flush()
-
-        # Step 2+3: Q1 和 Q2 并行生成（纯文本，各占 1 个并发槽）
-        async def gen_q1():
-            async with sem:
-                return await chat_text_only_async(Q1_GEN_PROMPT.format(num_q=4, description=description))
-
-        async def gen_q2():
-            async with sem:
-                return await chat_text_only_async(Q2_GEN_PROMPT.format(num_q=5, description=description))
-
-        q1_raw, q2_raw = await asyncio.gather(gen_q1(), gen_q2())
-
-        q1_pairs = extract_json_array(q1_raw)
-        if q1_pairs:
-            async with locks["q1"]:
-                for pair in q1_pairs:
-                    files["q1"].write(json.dumps({
-                        "messages": [
-                            {"role": "user", "content": f"<image>\n{pair['question']}"},
-                            {"role": "assistant", "content": pair["answer"]},
-                        ],
-                        "images": [img_path],
-                    }, ensure_ascii=False) + "\n")
-                files["q1"].flush()
-        else:
-            print(f"\n[Q1解析失败] {Path(img_path).name}: {q1_raw[:200]}")
-
-        q2_pairs = extract_json_array(q2_raw)
-        if q2_pairs:
-            async with locks["q2"]:
-                for pair in q2_pairs:
-                    files["q2"].write(json.dumps({
-                        "messages": [
-                            {"role": "user", "content": f"<image>\n{pair['question']}"},
-                            {"role": "assistant", "content": pair["answer"]},
-                        ],
-                        "images": [img_path],
-                    }, ensure_ascii=False) + "\n")
-                files["q2"].flush()
-        else:
-            print(f"\n[Q2解析失败] {Path(img_path).name}: {q2_raw[:200]}")
-
+        async with lock:
+            f_desc.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f_desc.flush()
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        print(f"\n[错误] {Path(img_path).name}: {e}")
+        tqdm.write(f"[错误-desc] {Path(img_path).name}: {e}")
+        fail_list.append(img_path)
+    finally:
+        pbar.update(1)
+
+
+async def process_q1(img_path, description, f_q1, lock, fail_list, sem, pbar):
+    try:
+        async with sem:
+            q1_raw = await chat_text_only_async(Q1_GEN_PROMPT.format(num_q=4, description=description))
+        q1_pairs = extract_json_array(q1_raw)
+        if q1_pairs:
+            async with lock:
+                for pair in q1_pairs:
+                    f_q1.write(json.dumps({
+                        "messages": [
+                            {"role": "user", "content": f"<image>\n{pair['question']}"},
+                            {"role": "assistant", "content": pair["answer"]},
+                        ],
+                        "images": [img_path],
+                    }, ensure_ascii=False) + "\n")
+                f_q1.flush()
+        else:
+            tqdm.write(f"[Q1解析失败] {Path(img_path).name}: {q1_raw[:200]}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        tqdm.write(f"[错误-Q1] {Path(img_path).name}: {e}")
+        fail_list.append(img_path)
+    finally:
+        pbar.update(1)
+
+
+async def process_q2(img_path, description, f_q2, lock, fail_list, sem, pbar):
+    try:
+        async with sem:
+            q2_raw = await chat_text_only_async(Q2_GEN_PROMPT.format(num_q=5, description=description))
+        q2_pairs = extract_json_array(q2_raw)
+        if q2_pairs:
+            async with lock:
+                for pair in q2_pairs:
+                    f_q2.write(json.dumps({
+                        "messages": [
+                            {"role": "user", "content": f"<image>\n{pair['question']}"},
+                            {"role": "assistant", "content": pair["answer"]},
+                        ],
+                        "images": [img_path],
+                    }, ensure_ascii=False) + "\n")
+                f_q2.flush()
+        else:
+            tqdm.write(f"[Q2解析失败] {Path(img_path).name}: {q2_raw[:200]}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        tqdm.write(f"[错误-Q2] {Path(img_path).name}: {e}")
         fail_list.append(img_path)
     finally:
         pbar.update(1)
@@ -529,74 +568,70 @@ async def main():
     q1_file = OUTPUT_DIR / "vqa_openended.jsonl"
     q2_file = OUTPUT_DIR / "vqa_specific.jsonl"
 
-    # ---- 计算 CoT 已占用图像 ----
-    print("计算 CoT 数据占用的图像...")
+    # ---- 计算 CoT 已占用图像（仅 post 侧） ----
+    print("计算 CoT 数据占用的 post 侧图像...")
     cot_images = get_cot_image_set()
-    print(f"  CoT 共占用: {len(cot_images)} 张图像\n")
+    print(f"  CoT 共占用: {len(cot_images)} 张 post 图像\n")
 
-    # ---- 收集图像（排除 CoT 已占用） ----
-    print("收集 VQA 可用图像（排除 CoT 已占用）...")
+    # ---- 收集 post 侧图像（排除 CoT 已占用） ----
+    print("收集 VQA 可用图像（仅 post 侧，排除 CoT 已占用）...")
     all_images = []
     for dtype, ds_name in [("ebd", "EBD"), ("levir", "LEVIR-CD+"), ("second", "SECOND")]:
         ds_path = DATASET_ROOT + "/" + ds_name
         imgs = collect_unique_images(ds_path, dtype)
         available = [p for p in imgs if p not in cot_images]
         sampled = available[:MAX_PER_DATASET]
-        print(
-            f"  {ds_name}: {len(imgs)} 张, CoT占用 {len(imgs) - len(available)}, VQA可用 {len(available)}, 采样 {len(sampled)}")
+        print(f"  {ds_name}: post图 {len(imgs)} 张, CoT占用 {len(imgs) - len(available)} 张, VQA可用 {len(available)} 张, 采样 {len(sampled)} 张")
         all_images.extend(sampled)
 
     random.shuffle(all_images)
-    print(f"  总计: {len(all_images)} 张图像\n")
-
-    # ---- 断点续传：三个文件都完成才算完成 ----
-    def _load_completed(filepath):
-        s = set()
-        if filepath.exists():
-            with open(filepath, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        s.add(rec["images"][0])
-                    except Exception:
-                        pass
-        return s
-
-    done_desc = _load_completed(desc_file)
-    done_q1 = _load_completed(q1_file)
-    done_q2 = _load_completed(q2_file)
-    done_full = done_desc & done_q1 & done_q2  # 取交集，三个文件都有才算完成
-
-    remaining = [p for p in all_images if p not in done_full]
-    print(f"  desc已完成: {len(done_desc)}, q1已完成: {len(done_q1)}, q2已完成: {len(done_q2)}")
-    print(f"  三者交集（真正完成）: {len(done_full)}, 待处理: {len(remaining)}\n")
-
-    if not remaining:
-        print("全部已完成。")
-        return
+    print(f"  总计: {len(all_images)} 张 post 图像\n")
 
     fail_list = []
     sem = asyncio.Semaphore(args.concurrency)
-    locks = {
-        "desc": asyncio.Lock(),
-        "q1": asyncio.Lock(),
-        "q2": asyncio.Lock(),
-    }
 
-    with (
-        open(desc_file, "a", encoding="utf-8") as f_desc,
-        open(q1_file, "a", encoding="utf-8") as f_q1,
-        open(q2_file, "a", encoding="utf-8") as f_q2,
-    ):
-        files = {"desc": f_desc, "q1": f_q1, "q2": f_q2}
-        with tqdm(total=len(remaining), desc="生成双尺度描述+VQA") as pbar:
-            await asyncio.gather(*[
-                process_image(img_path, files, locks, fail_list, sem, pbar)
-                for img_path in remaining
-            ])
+    # ==================== Phase 1: 双尺度描述 ====================
+    done_desc = _load_completed(desc_file)
+    desc_remaining = [p for p in all_images if p not in done_desc]
+    print(f"[Phase 1] 双尺度描述  已完成 {len(done_desc)} / {len(all_images)}, 待处理 {len(desc_remaining)}")
+    if desc_remaining:
+        lock_desc = asyncio.Lock()
+        with open(desc_file, "a", encoding="utf-8") as f_desc:
+            with tqdm(total=len(desc_remaining), desc="Phase 1 双尺度描述") as pbar:
+                await asyncio.gather(*[
+                    process_desc(p, f_desc, lock_desc, fail_list, sem, pbar)
+                    for p in desc_remaining
+                ])
+
+    # ==================== 加载描述映射 ====================
+    desc_map = _load_desc_map(desc_file)
+    print(f"\n描述映射加载: {len(desc_map)} 条")
+
+    # ==================== Phase 2: Q1 开放式问答 ====================
+    done_q1 = _load_completed(q1_file)
+    q1_remaining = [(p, desc_map[p]) for p in all_images if p not in done_q1 and p in desc_map]
+    print(f"\n[Phase 2] Q1 开放式问答  已完成 {len(done_q1)} / {len(all_images)}, 待处理 {len(q1_remaining)}")
+    if q1_remaining:
+        lock_q1 = asyncio.Lock()
+        with open(q1_file, "a", encoding="utf-8") as f_q1:
+            with tqdm(total=len(q1_remaining), desc="Phase 2 Q1开放式") as pbar:
+                await asyncio.gather(*[
+                    process_q1(p, desc, f_q1, lock_q1, fail_list, sem, pbar)
+                    for p, desc in q1_remaining
+                ])
+
+    # ==================== Phase 3: Q2 具体关系/计数 ====================
+    done_q2 = _load_completed(q2_file)
+    q2_remaining = [(p, desc_map[p]) for p in all_images if p not in done_q2 and p in desc_map]
+    print(f"\n[Phase 3] Q2 具体关系/计数  已完成 {len(done_q2)} / {len(all_images)}, 待处理 {len(q2_remaining)}")
+    if q2_remaining:
+        lock_q2 = asyncio.Lock()
+        with open(q2_file, "a", encoding="utf-8") as f_q2:
+            with tqdm(total=len(q2_remaining), desc="Phase 3 Q2具体关系") as pbar:
+                await asyncio.gather(*[
+                    process_q2(p, desc, f_q2, lock_q2, fail_list, sem, pbar)
+                    for p, desc in q2_remaining
+                ])
 
     # ---- 统计 ----
     print("\n" + "=" * 60)

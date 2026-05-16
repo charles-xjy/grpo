@@ -36,6 +36,7 @@ class AsyncGenRMReward(AsyncORM):
         from openai import OpenAI
         self.api_base = os.getenv('GENRM_API_BASE', 'http://localhost:8001/v1')
         self.temperature = float(os.getenv('GENRM_TEMPERATURE', '0.3'))
+        self.sem = asyncio.Semaphore(int(os.getenv('GENRM_CONCURRENCY', '4')))
 
         # Initialize OpenAI client to get the model name
         try:
@@ -165,17 +166,18 @@ class AsyncGenRMReward(AsyncORM):
         }
 
         try:
-            async with session.post(
-                    f'{self.api_base}/chat/completions', json=payload,
-                    timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.warning(f'API error {resp.status}: {error_text[:200]}')
-                    return 0.0
+            async with self.sem:
+                async with session.post(
+                        f'{self.api_base}/chat/completions', json=payload,
+                        timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.warning(f'API error {resp.status}: {error_text[:200]}')
+                        return 0.0
 
-                result = await resp.json()
-                response_content = result['choices'][0]['message']['content']
-                return self._extract_score(response_content, dim['max_score'])
+                    result = await resp.json()
+                    response_content = result['choices'][0]['message']['content']
+                    return self._extract_score(response_content, dim['max_score'])
 
         except asyncio.TimeoutError:
             logger.warning(f'API request timed out for dimension {dim["name"]}')

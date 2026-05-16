@@ -57,12 +57,21 @@ SECOND_sft.jsonl
 
 `construct_vqa_data.py` 从未被 CoT 数据占用的剩余图像中，生成三类数据，输出到 `vqa_data/` 目录。
 
-**流程（每张图像）：**
-1. 调用教师模型生成**双尺度描述**（宏观场景 + 微观地物清单）
-2. 基于描述，纯文本生成 4 个**开放式问答**（Q1）
-3. 基于描述，纯文本生成 5 个**具体关系/计数问答**（Q2）
+**图像采集策略：只取 post 侧图像**（EBD 取 post_disaster，LEVIR 取 B，SECOND 取 im2），避免 pre/post 同场景内容重复。CoT 占用集合同步只计 post 侧，共 3900 张。
 
-**采样上限：** 每个数据集最多取 3000 张图像（排除 CoT 已使用的部分）。
+**三阶段顺序执行：**
+
+```
+Phase 1  双尺度描述（含图推理，耗时最长）
+         ↓ 全量完成后加载 desc_map
+Phase 2  Q1 开放式问答（纯文本，依赖 Phase 1 的描述）
+         ↓
+Phase 3  Q2 具体关系/计数问答（纯文本，依赖 Phase 1 的描述）
+```
+
+每阶段各自独立断点续传，重启时自动跳过已完成部分，无需等待前序阶段重跑。
+
+**采样上限：** 每个数据集最多取 3000 张 post 图像（排除 CoT 已使用的部分）。
 
 **输出文件：**
 ```
@@ -71,8 +80,6 @@ vqa_data/
 ├── vqa_openended.jsonl     # 开放式问答
 └── vqa_specific.jsonl      # 空间关系/计数问答
 ```
-
-同样支持**断点续传**（详见[断点续传机制](#断点续传机制)）。
 
 ## 环境依赖
 
@@ -85,11 +92,14 @@ pip install openai tqdm
 教师模型需在本地以 OpenAI 兼容接口方式部署（默认端口 `8001`）：
 
 ```bash
-vllm serve Qwen/Qwen3-VL-32B-Instruct \
-  --tensor-parallel-size 2 \
-  --port 8001 \
-  --no-enable-chunked-prefill   # Qwen3-VL 必须加，否则多图并发会触发 deepstack buffer 溢出
+CUDA_VISIBLE_DEVICES=1,2 vllm serve Qwen/Qwen3-VL-32B-Instruct \
+  --trust-remote-code --dtype bfloat16 \
+  --tensor-parallel-size 2 --max-model-len 12000 \
+  --enforce-eager \
+  --gpu-memory-utilization 0.95 --port 8001
 ```
+
+> **为什么必须加 `--enforce-eager`：** Qwen3-VL 的 deepstack 机制要求 buffer 按图像分辨率动态分配。vLLM 0.20.0 在 CUDA graph 模式下按 `total_num_scheduled_tokens` 静态分配 buffer，当 prefill 请求与 decode 请求被 batch queue 合并后，总 token 数可能小于单图所需的 deepstack tokens（例如 278 < 288），导致 EngineCore 崩溃。`--enforce-eager` 禁用 CUDA graph，改为动态分配，彻底规避此问题。`--no-enable-chunked-prefill` 对此无效。
 
 或使用 swift：
 
@@ -117,22 +127,26 @@ swift deploy --model Qwen/Qwen3-VL-32B-Instruct --port 8001 --infer_backend vllm
 
 文件写入通过 `threading.Lock` 保证线程安全。
 
-### construct_vqa_data.py — 异步并行（每图 3 路并发）
+### construct_vqa_data.py — 异步三阶段并行
 
-基于 `asyncio` + `Semaphore`，每张图像内部也有并行：生成双尺度描述后，Q1（开放式问答）和 Q2（关系/计数问答）两路纯文本请求通过 `asyncio.gather` 同时发出，单张图像总耗时约等于"描述生成 + max(Q1, Q2)"而非三者之和。
+基于 `asyncio` + `Semaphore`，三个阶段顺序执行，每阶段内部所有图像任务并行，由全局 `Semaphore(concurrency)` 限制同时打到 vLLM 的请求数。
 
 ```
-每张图像的处理流程：
-
-Step 1 │ 双尺度描述（含图，占 1 槽）
-       ↓ 描述生成完成
-Step 2 │ Q1 生成（纯文本）┐
-       │ Q2 生成（纯文本）┘← asyncio.gather 并行，各占 1 槽
-       ↓ 两路同时完成
-       写入三个输出文件
+Phase 1（所有图像并行）：
+  image_1 → desc  ─┐
+  image_2 → desc   ├─ Semaphore(4) 控制并发
+  ...              │
+  image_N → desc  ─┘
+           ↓ 全部完成，加载 desc_map
+Phase 2（所有图像并行）：
+  (image_1, desc_1) → Q1 ─┐
+  ...                      ├─ Semaphore(4)
+Phase 3（所有图像并行）：
+  (image_1, desc_1) → Q2 ─┐
+  ...                      ├─ Semaphore(4)
 ```
 
-全局并发上限由 `asyncio.Semaphore(concurrency)` 统一控制，所有图像的所有子任务共享这个槽位池。
+进度条每个阶段独立显示，每完成一张图立即更新。
 
 ## 断点续传机制
 
@@ -170,25 +184,24 @@ Step 2 │ Q1 生成（纯文本）┐
 
 `construct_sft_data.py` 的断点粒度是**单条 pair**。每个输出 JSONL 文件独立判断，`images[0]` 对应 pre 图路径。
 
-### VQA 脚本（三文件取交集）
+### VQA 脚本（三阶段各自独立断点续传）
 
-`construct_vqa_data.py` 输出三个文件：`dual_scale_desc.jsonl`、`vqa_openended.jsonl`、`vqa_specific.jsonl`。一张图像需要**三个文件都有对应记录**才算完成，取三者的交集。
+`construct_vqa_data.py` 采用三阶段架构，每阶段独立检查自己的输出文件：
 
-```
-done_desc = {已生成描述的图像}
-done_q1   = {已生成开放式问答的图像}
-done_q2   = {已生成关系/计数问答的图像}
-
-真正完成 = done_desc ∩ done_q1 ∩ done_q2  （三个文件都有才算）
-```
-
-这样确保：即使某张图只生成了描述但 Q1/Q2 解析失败，下次运行也会重新处理整张图，不会漏掉任何环节。
+- **Phase 1**：检查 `dual_scale_desc.jsonl`，跳过已有描述的图像
+- **Phase 2**：检查 `vqa_openended.jsonl`，跳过已有 Q1 的图像（需 Phase 1 已生成对应描述）
+- **Phase 3**：检查 `vqa_specific.jsonl`，跳过已有 Q2 的图像（需 Phase 1 已生成对应描述）
 
 运行时日志示例：
 
 ```
-  desc已完成: 1500, q1已完成: 1480, q2已完成: 1470
-  三者交集（真正完成）: 1470, 待处理: 530
+[Phase 1] 双尺度描述  已完成 1500 / 6147, 待处理 4647
+Phase 1 双尺度描述: 100%|████████| 4647/4647 [1:02:13<00:00,  1.24it/s]
+
+描述映射加载: 6147 条
+
+[Phase 2] Q1 开放式问答  已完成 1480 / 6147, 待处理 4667
+[Phase 3] Q2 具体关系/计数  已完成 1470 / 6147, 待处理 4677
 ```
 
 ### 失败恢复场景速查
@@ -204,7 +217,7 @@ done_q2   = {已生成关系/计数问答的图像}
 ### 注意事项
 
 - **唯一标识是 `images[0]` 字符串**：因此不要移动图像文件目录，否则路径变化会导致断点续传失效（新旧路径不匹配，已完成的记录无法被识别）。
-- **VQA 的每图 3 个子任务是原子的**：如果 Step 2（Q1+Q2 并行生成）中只有一个成功另一个解析失败，整张图下次会重做——已经成功的那个子任务会在输出文件中产生一条重复记录。这是可接受的，因为重做一张图的开销远小于漏数据。
+- **VQA 三阶段独立续传**：desc/Q1/Q2 各自独立判断完成状态。若某图 Phase 1 desc 已完成但 Phase 2 Q1 失败，下次重启只会在 Phase 2 重跑该图的 Q1，不影响 Phase 1 已有的描述。
 
 ## 运行数据构建脚本
 
@@ -245,7 +258,10 @@ python construct_vqa_data.py [--base-url URL] [--concurrency N] [--retries N]
 ```bash
 export GENRM_API_BASE=http://localhost:8001/v1   # 默认值
 export GENRM_TEMPERATURE=0.3                      # 默认值
+export GENRM_CONCURRENCY=4                        # 全局并发上限，默认 4
 ```
+
+**并发控制：** 单个 completion 的 4 个维度通过 `asyncio.gather` 同时打分；全局 `asyncio.Semaphore(GENRM_CONCURRENCY)` 限制同时打到 vLLM 的请求总数，避免多 completion 并发时压垮服务。
 
 ### 在 swift GRPO 训练中使用
 
