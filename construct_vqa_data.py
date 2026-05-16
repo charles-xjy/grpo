@@ -549,23 +549,30 @@ async def main():
     random.shuffle(all_images)
     print(f"  总计: {len(all_images)} 张图像\n")
 
-    # ---- 断点续传：加载已完成 ----
-    done_desc = set()
-    for f in [desc_file, q1_file, q2_file]:
-        if f.exists():
-            with open(f, "r", encoding="utf-8") as fh:
+    # ---- 断点续传：三个文件都完成才算完成 ----
+    def _load_completed(filepath):
+        s = set()
+        if filepath.exists():
+            with open(filepath, "r", encoding="utf-8") as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:
                         continue
                     try:
                         rec = json.loads(line)
-                        done_desc.add(rec["images"][0])
+                        s.add(rec["images"][0])
                     except Exception:
                         pass
+        return s
 
-    remaining = [p for p in all_images if p not in done_desc]
-    print(f"已完成: {len(done_desc)}, 待处理: {len(remaining)}\n")
+    done_desc = _load_completed(desc_file)
+    done_q1 = _load_completed(q1_file)
+    done_q2 = _load_completed(q2_file)
+    done_full = done_desc & done_q1 & done_q2  # 取交集，三个文件都有才算完成
+
+    remaining = [p for p in all_images if p not in done_full]
+    print(f"  desc已完成: {len(done_desc)}, q1已完成: {len(done_q1)}, q2已完成: {len(done_q2)}")
+    print(f"  三者交集（真正完成）: {len(done_full)}, 待处理: {len(remaining)}\n")
 
     if not remaining:
         print("全部已完成。")
