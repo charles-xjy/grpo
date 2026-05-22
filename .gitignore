@@ -1,5 +1,5 @@
 try_data_process/
-EBD_sft.jsonl
-LEVIR-CD+_sft.jsonl
-SECOND_sft.jsonl
+sft_data/EBD_sft.jsonl
+sft_data/LEVIR-CD+_sft.jsonl
+sft_data/SECOND_sft.jsonl
 vqa_data/

@@ -179,7 +179,7 @@ Q2_GEN_PROMPT = """# Role
 
 # Context
 下面是一张遥感图像的**双尺度描述文本**（包含宏观场景信息和微观地物细节）。
-你的任务是基于这段描述，生成**具体的空间关系/属性查询/计数类问题**及其标准答案。
+你的任务是基于这段描述，生成**具体的空间关系/属性查询/计数类问题**，并为每个问题提供**带推理过程的答案**。
 
 # Task
 基于提供的描述，生成 {num_q} 个具体问题。问题类型应多样化，从以下类型中均匀选取：
@@ -196,7 +196,10 @@ Q2_GEN_PROMPT = """# Role
 - 每个问题必须包含至少一个**具体的视觉属性约束**（颜色、形状、大小、材质、方位等），如"红色的房子""左侧的河流""最大的建筑"。
 - 计数类问题的数量必须是描述中明确可数的。
 - 空间关系问题必须涉及至少两个地物之间的方位、距离或拓扑关系。
-- 答案必须精确、简短、可以从描述中直接验证。计数类答案纯数字即可（如"3 辆"），空间类答案简洁明确（如"东侧""紧邻"）。
+
+**答案要求：**
+- `thinking` 字段：按编号步骤逐步推导，格式为"步骤1：...步骤2：...步骤N：..."，体现定位目标地物、提取相关信息、得出结论的完整推理链（2-4 步）。
+- `answer` 字段：用完整句子回答问题（如"现在小明有5个苹果。"而非"5个"），语言简洁自然。
 
 # Input: 图像双尺度描述
 {description}
@@ -205,7 +208,7 @@ Q2_GEN_PROMPT = """# Role
 输出一个 JSON 数组（不要包含其他文字）：
 ```json
 [
-  {{"question": "问题文本", "answer": "答案文本"}},
+  {{"question": "问题文本", "thinking": "推理过程", "answer": "最终答案"}},
   ...
 ]
 ```
@@ -542,10 +545,16 @@ async def process_q2(img_path, description, f_q2, lock, fail_list, sem, pbar):
         if q2_pairs:
             async with lock:
                 for pair in q2_pairs:
+                    thinking = pair.get("thinking", "").strip()
+                    answer = pair.get("answer", "").strip()
+                    if thinking:
+                        full_answer = f"<think>\n{thinking}\n</think>\n{answer}"
+                    else:
+                        full_answer = answer
                     f_q2.write(json.dumps({
                         "messages": [
                             {"role": "user", "content": f"<image>\n{pair['question']}"},
-                            {"role": "assistant", "content": pair["answer"]},
+                            {"role": "assistant", "content": full_answer},
                         ],
                         "images": [img_path],
                     }, ensure_ascii=False) + "\n")

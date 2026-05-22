@@ -51,7 +51,7 @@ print(f"Using model: {model_name}")
 client = OpenAI(api_key="EMPTY", base_url=f"{base_url}/v1")
 
 DATASET_ROOT = "/home/charles/mycode/sft+rl/dataset"
-OUTPUT_DIR = Path("/home/charles/mycode/grpo")
+OUTPUT_DIR = Path("/home/charles/mycode/grpo/sft_data")
 
 # 每个数据集的采样数量
 EBD_PER_EVENT = 200  # EBD 每种灾害类型抽 200 对
@@ -435,6 +435,7 @@ def process_dataset(name, pairs, teacher_prompt_template, user_instructions, out
 
 
 def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     # ── 构建所有数据集并打印汇总 ──
     ebd_all = build_ebd_pairs(DATASET_ROOT + "/EBD")
     ebd_by_event = defaultdict(list)
