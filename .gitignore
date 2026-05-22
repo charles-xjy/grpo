@@ -1,5 +1,3 @@
-try_data_process/
-sft_data/EBD_sft.jsonl
-sft_data/LEVIR-CD+_sft.jsonl
-sft_data/SECOND_sft.jsonl
-vqa_data/
+#vqa_data/
+sft_output/
+swanlog/
