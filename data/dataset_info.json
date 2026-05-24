@@ -1,6 +1,6 @@
 {
-  "stage1_vqa_openended": {
-    "file_name": "/home/charles/mycode/grpo/vqa_data/vqa_openended.jsonl",
+  "stage1_dual_scale": {
+    "file_name": "/home/charles/mycode/grpo/data/vqa_data/dual_scale_desc.jsonl",
     "formatting": "sharegpt",
     "columns": {
       "messages": "messages",
@@ -13,8 +13,8 @@
       "assistant_tag": "assistant"
     }
   },
-  "stage1_dual_scale": {
-    "file_name": "/home/charles/mycode/grpo/vqa_data/dual_scale_desc.jsonl",
+  "stage1_vqa_openended": {
+    "file_name": "/home/charles/mycode/grpo/data/vqa_data/vqa_openended.jsonl",
     "formatting": "sharegpt",
     "columns": {
       "messages": "messages",
@@ -28,7 +28,7 @@
     }
   },
   "stage1_vqa_specific": {
-    "file_name": "/home/charles/mycode/grpo/vqa_data/vqa_specific.jsonl",
+    "file_name": "/home/charles/mycode/grpo/data/vqa_data/vqa_specific.jsonl",
     "formatting": "sharegpt",
     "columns": {
       "messages": "messages",
@@ -42,7 +42,7 @@
     }
   },
   "stage2_ebd": {
-    "file_name": "/home/charles/mycode/grpo/sft_data/EBD_sft.jsonl",
+    "file_name": "/home/charles/mycode/grpo/data/sft_data/EBD_sft.jsonl",
     "formatting": "sharegpt",
     "columns": {
       "messages": "messages",
@@ -56,7 +56,7 @@
     }
   },
   "stage2_levir": {
-    "file_name": "/home/charles/mycode/grpo/sft_data/LEVIR-CD+_sft.jsonl",
+    "file_name": "/home/charles/mycode/grpo/data/sft_data/LEVIR-CD+_sft.jsonl",
     "formatting": "sharegpt",
     "columns": {
       "messages": "messages",
@@ -70,7 +70,7 @@
     }
   },
   "stage2_second": {
-    "file_name": "/home/charles/mycode/grpo/sft_data/SECOND_sft.jsonl",
+    "file_name": "/home/charles/mycode/grpo/data/sft_data/SECOND_sft.jsonl",
     "formatting": "sharegpt",
     "columns": {
       "messages": "messages",
@@ -81,6 +81,13 @@
       "content_tag": "content",
       "user_tag": "user",
       "assistant_tag": "assistant"
+    }
+  },
+  "remote_sensing_grpo": {
+    "file_name": "grpo_swift.jsonl",
+    "columns": {
+      "prompt": "messages",
+      "images": "images"
     }
   }
 }

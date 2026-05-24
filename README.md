@@ -6,10 +6,33 @@
 
 ```
 grpo/
-├── construct_sft_data.py   # 构建变化检测 CoT-SFT 数据
-├── construct_vqa_data.py   # 构建单图双尺度描述与 VQA 数据
-├── plugin.py               # GRPO 训练的 LLM-as-Judge 奖励函数插件
-└── test_vllm.py            # 测试 vLLM 多模态接口的单次请求脚本
+├── data/                          # LLaMA-Factory 数据集注册
+│   └── dataset_info.json
+├── sft_data/                      # Stage 2 SFT 数据（图像对）
+│   ├── EBD_sft.jsonl              #   地震灾害对比 (1400条)
+│   ├── LEVIR-CD+_sft.jsonl        #   建筑物变化检测 (500条)
+│   └── SECOND_sft.jsonl           #   地表覆盖变化 (2000条)
+├── vqa_data/                      # Stage 1 VQA 数据（单图）
+│   ├── dual_scale_desc.jsonl      #   双尺度描述
+│   ├── vqa_openended.jsonl        #   开放式问答
+│   └── vqa_specific.jsonl         #   空间关系/计数问答
+│
+├── construct_sft_data.py          # 数据构造：教师模型生成 SFT 数据
+├── construct_vqa_data.py          # 数据构造：教师模型生成 VQA 数据
+├── construct_grpo_data.py         # 数据构造：生成仅含提问的 GRPO 数据
+├── score_evaluation.py            # 测评打分：教师模型作为裁判
+├── evaluate_model.py              # 模型测评：教师出题，学生答题
+├── augment_vqa_prompts.py         # 问题多样化改写
+├── print_samples.py               # 打印数据文件前 N 条
+│
+├── sft_loar.yaml                  # Stage 1 训练配置
+├── cot_loar.yaml                  # Stage 2 训练配置
+│
+├── sft_output/                    # Stage 1 LoRA 输出
+├── sft_stage1_merged/             # Stage 1 合并后模型
+│
+├── plugin.py                      # GRPO 训练的 LLM-as-Judge 奖励函数
+└── test_vllm.py                   # 测试 vLLM 多模态接口
 ```
 
 ## 数据集
@@ -29,246 +52,208 @@ grpo/
 `construct_sft_data.py` 使用本地部署的教师模型对三个数据集的图像对进行推理，生成专业分析文本，输出 SFT 格式的 JSONL 文件。
 
 **采样策略：**
-- EBD：每种灾害类型取前 200 对
-- LEVIR-CD+：顺序取前 500 对
-- SECOND：顺序取前 2000 对
-
-**输出文件：**
-```
-EBD_sft.jsonl
-LEVIR-CD+_sft.jsonl
-SECOND_sft.jsonl
-```
-
-**数据格式：**
-```json
-{
-  "messages": [
-    {"role": "user", "content": "<image>\n<image>\n{随机指令}"},
-    {"role": "assistant", "content": "{教师模型生成的分析报告}"}
-  ],
-  "images": ["/path/to/pre.png", "/path/to/post.png"]
-}
-```
-
-支持**断点续传**：重新运行会自动跳过已处理的图像对（详见[断点续传机制](#断点续传机制)）。
+- EBD：每种灾害类型取前 20 对（共 7 事件，~140 对）
+- LEVIR-CD+：顺序取前 100 对
+- SECOND：顺序取前 100 对
 
 ### 2. 双尺度描述 + VQA 数据（单图）
 
-`construct_vqa_data.py` 从未被 CoT 数据占用的剩余图像中，生成三类数据，输出到 `vqa_data/` 目录。
+`construct_vqa_data.py` 从未被 CoT 数据占用的剩余图像中，生成三类数据，输出到 `vqa_data/` 目录。每张图产出 1 + 3 + 3 = 7 条 Q&A 记录，三数据集共 ~2380 条。
 
-**图像采集策略：只取 post 侧图像**（EBD 取 post_disaster，LEVIR 取 B，SECOND 取 im2），避免 pre/post 同场景内容重复。CoT 占用集合同步只计 post 侧，共 3900 张。
+### 3. GRPO Prompt 数据（强化学习）
 
-**三阶段顺序执行：**
+`construct_grpo_data.py` 从剩余未使用的影像中采样，生成仅包含提问（Prompts）的数据集，用于后续的 GRPO 强化学习训练。
 
-```
-Phase 1  双尺度描述（含图推理，耗时最长）
-         ↓ 全量完成后加载 desc_map
-Phase 2  Q1 开放式问答（纯文本，依赖 Phase 1 的描述）
-         ↓
-Phase 3  Q2 具体关系/计数问答（纯文本，依赖 Phase 1 的描述）
-```
+**采样规模：**
+- EBD: 300 条
+- LEVIR-CD+: 500 条
+- SECOND: 1500 条
+- **总计: 2300 条**
 
-每阶段各自独立断点续传，重启时自动跳过已完成部分，无需等待前序阶段重跑。
-
-**采样上限：** 每个数据集最多取 3000 张 post 图像（排除 CoT 已使用的部分）。
-
-**输出文件：**
-```
-vqa_data/
-├── dual_scale_desc.jsonl   # 单图双尺度解译
-├── vqa_openended.jsonl     # 开放式问答
-└── vqa_specific.jsonl      # 空间关系/计数问答
+**数据格式：**
+符合 MS-Swift 的多模态 `chat_dataset` 规范，且全部使用绝对路径以保证训练稳定性。
+```json
+{
+  "messages": [{"role": "user", "content": "<image>\n<image>\n{随机人设+任务指令}"}],
+  "images": ["/abs/path/pre.png", "/abs/path/post.png"]
+}
 ```
 
 ## 环境依赖
 
 ```bash
-pip install openai tqdm
+pip install openai tqdm pandas pyarrow
 ```
 
-## vLLM 部署
+## 训练流程
 
-教师模型需在本地以 OpenAI 兼容接口方式部署（默认端口 `8001`）：
+### Stage 1：VQA 单图训练
+使用三个 VQA 数据集，在 Qwen3-VL-4B-Instruct 上训练第一轮 LoRA。
+```bash
+llamafactory-cli train sft_loar.yaml
+```
+
+### Stage 2：SFT 图像对训练
+基于合并后的 Stage 1 模型，使用三个图像对数据集进行第二轮 SFT。
+```bash
+llamafactory-cli train cot_loar.yaml
+```
+
+### Stage 3：GRPO 强化学习训练
+
+在完成两阶段 SFT 后，使用 GRPO (Group Relative Policy Optimization) 进一步优化模型的解译质量。
+
+#### 1. 注册数据集
+在 `data/dataset_info.json` 中添加：
+```json
+"remote_sensing_grpo":{
+  "file_name": "grpo_swift.jsonl",
+  "columns": {
+    "prompt": "messages",
+    "images": "images"
+  }
+}
+```
+
+#### 2. 启动训练
+
+以下是针对 **3 张 5880 显卡 (单卡约 48GB 显存)** 且裁判模型（教师模型）为 **32B 级别大模型** 所深度优化的 GRPO 训练脚本。该脚本采用了 `colocate` 模式以最大化吞吐量，并对显存分配进行了极限切分。
 
 ```bash
-CUDA_VISIBLE_DEVICES=1,2 vllm serve Qwen/Qwen3-VL-32B-Instruct \
-  --trust-remote-code --dtype bfloat16 \
-  --tensor-parallel-size 2 --max-model-len 12000 \
-  --enforce-eager \
-  --gpu-memory-utilization 0.95 --port 8001
-```
+#!/bin/bash
 
-> **为什么必须加 `--enforce-eager`：** Qwen3-VL 的 deepstack 机制要求 buffer 按图像分辨率动态分配。vLLM 0.20.0 在 CUDA graph 模式下按 `total_num_scheduled_tokens` 静态分配 buffer，当 prefill 请求与 decode 请求被 batch queue 合并后，总 token 数可能小于单图所需的 deepstack tokens（例如 278 < 288），导致 EngineCore 崩溃。`--enforce-eager` 禁用 CUDA graph，改为动态分配，彻底规避此问题。`--no-enable-chunked-prefill` 对此无效。
+# 1. 显存碎片管理
+# 允许 PyTorch 动态扩展已分配的显存段，极大降低跑大模型时长文本引发的显存碎片化 OOM 风险。
+export PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True'
 
-或使用 swift：
+# 2. 奖励模型连接配置
+# 裁判模型地址：指向本地 8002 端口的 32B 教师模型
+export GENRM_API_BASE=http://localhost:8002/v1
+# 裁判打分时的温度参数，0.3 偏向确定性与客观性
+export GENRM_TEMPERATURE=0.3
+# 控制打分插件并发打到 8002 端口的请求数，避免瞬间压垮 32B 模型
+export GENRM_CONCURRENCY=1
 
-```bash
-swift deploy --model Qwen/Qwen3-VL-32B-Instruct --port 8001 --infer_backend vllm
-```
+# 3. 启动 Swift GRPO (严格基于 3 张 5880 显卡)
+# 将 0, 1, 2 号共 3 张显卡全部投入训练进程
+CUDA_VISIBLE_DEVICES=0 \
+# 告诉 DeepSpeed 等分布式框架，当前节点启用了 3 个进程
 
-## 并行加速机制
-
-两个数据构建脚本均针对大规模数据生成进行了并行优化，是本项目的核心亮点。
-
-### construct_sft_data.py — 多线程并行
-
-基于 `ThreadPoolExecutor` + `as_completed`，所有图像对任务一次性提交入队，始终保持 `--concurrency` 个线程同时向 vLLM 发送请求。哪个请求先返回就先写入文件，不阻塞其他线程。
-
-```
-提交阶段：1000 个任务全部入队（瞬间完成）
-          ↓
-执行阶段：Thread-1 ──── 请求A ──── 写入
-          Thread-2 ──── 请求B ──── 写入     ← 始终保持 N 个并发
-          Thread-3 ──── 请求C ──── 写入
-          Thread-4 ──── 请求D ──── 写入
-                   请求D完成 → Thread-4 立即取下一个任务
-```
-
-文件写入通过 `threading.Lock` 保证线程安全。
-
-### construct_vqa_data.py — 异步三阶段并行
-
-基于 `asyncio` + `Semaphore`，三个阶段顺序执行，每阶段内部所有图像任务并行，由全局 `Semaphore(concurrency)` 限制同时打到 vLLM 的请求数。
-
-```
-Phase 1（所有图像并行）：
-  image_1 → desc  ─┐
-  image_2 → desc   ├─ Semaphore(4) 控制并发
-  ...              │
-  image_N → desc  ─┘
-           ↓ 全部完成，加载 desc_map
-Phase 2（所有图像并行）：
-  (image_1, desc_1) → Q1 ─┐
-  ...                      ├─ Semaphore(4)
-Phase 3（所有图像并行）：
-  (image_1, desc_1) → Q2 ─┐
-  ...                      ├─ Semaphore(4)
-```
-
-进度条每个阶段独立显示，每完成一张图立即更新。
-
-## 断点续传机制
-
-两个数据构建脚本均支持断点续传，脚本崩溃、手动 Ctrl+C、vLLM 服务重启后，重新运行即可从断点继续，不会浪费已完成的计算。
-
-### 核心原理
-
-**将输出文件视为"已完成记录"的来源。** 每次启动时：
-
-1. 读取已存在的输出 JSONL 文件，逐行解析
-2. 提取每条记录中的 `images[0]`（图像路径）作为唯一标识，存入 set
-3. 从完整待处理列表中过滤掉已完成的，只处理剩余部分
-4. 以 **追加模式** (`"a"`) 打开输出文件，每处理完一条立即 `write + flush` 落盘
-
-```
-脚本启动
-  │
-  ├─ 1. 构建完整的待处理列表
-  │
-  ├─ 2. 读取输出 JSONL → 提取 images[0] → done_set
-  │      ┌─ 文件存在 → done_set 有数据
-  │      └─ 文件不存在 → done_set 为空
-  │
-  ├─ 3. remaining = 全量 - done_set
-  │     打印: 总计 X | 已完成 Y | 待处理 Z
-  │
-  ├─ 4. 以 append 模式处理 remaining
-  │     每成功一条 → 立即写入 + flush（保证落盘）
-  │     失败 → 记入 fail_list，不写入文件
-  │
-  └─ 5. 打印统计，失败的记录下次运行自动重试
-```
-
-### SFT 脚本（单文件）
-
-`construct_sft_data.py` 的断点粒度是**单条 pair**。每个输出 JSONL 文件独立判断，`images[0]` 对应 pre 图路径。
-
-### VQA 脚本（三阶段各自独立断点续传）
-
-`construct_vqa_data.py` 采用三阶段架构，每阶段独立检查自己的输出文件：
-
-- **Phase 1**：检查 `dual_scale_desc.jsonl`，跳过已有描述的图像
-- **Phase 2**：检查 `vqa_openended.jsonl`，跳过已有 Q1 的图像（需 Phase 1 已生成对应描述）
-- **Phase 3**：检查 `vqa_specific.jsonl`，跳过已有 Q2 的图像（需 Phase 1 已生成对应描述）
-
-运行时日志示例：
-
-```
-[Phase 1] 双尺度描述  已完成 1500 / 6147, 待处理 4647
-Phase 1 双尺度描述: 100%|████████| 4647/4647 [1:02:13<00:00,  1.24it/s]
-
-描述映射加载: 6147 条
-
-[Phase 2] Q1 开放式问答  已完成 1480 / 6147, 待处理 4667
-[Phase 3] Q2 具体关系/计数  已完成 1470 / 6147, 待处理 4677
-```
-
-### 失败恢复场景速查
-
-| 场景 | 行为 |
-|------|------|
-| 脚本中途崩溃 / Ctrl+C | 已写入的记录已落盘，下次自动跳过 |
-| 某条记录重试耗尽仍失败 | 不写入文件，下次运行重新尝试 |
-| vLLM 服务重启 | 当前正在处理的请求触发重试（指数退避 2ⁿ 秒），重试耗尽则记入 fail_list |
-| 输出文件被误删 | done_set 为空，该文件对应的所有记录从头生成 |
-| 想强制重新处理某条记录 | 在输出 JSONL 中删除对应行，重新运行即可 |
-
-### 注意事项
-
-- **唯一标识是 `images[0]` 字符串**：因此不要移动图像文件目录，否则路径变化会导致断点续传失效（新旧路径不匹配，已完成的记录无法被识别）。
-- **VQA 三阶段独立续传**：desc/Q1/Q2 各自独立判断完成状态。若某图 Phase 1 desc 已完成但 Phase 2 Q1 失败，下次重启只会在 Phase 2 重跑该图的 Q1，不影响 Phase 1 已有的描述。
-
-## 运行数据构建脚本
-
-```bash
-# 构建变化检测 SFT 数据
-python construct_sft_data.py [--base-url URL] [--concurrency N] [--retries N]
-
-# 构建单图描述与 VQA 数据
-python construct_vqa_data.py [--base-url URL] [--concurrency N] [--retries N]
-```
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--model` | 自动探测 | 指定模型名，也可通过 `$VLLM_MODEL` 环境变量设置 |
-| `--base-url` | `http://localhost:8001` | vLLM 服务地址 |
-| `--concurrency` | `4` | 并行请求数 |
-| `--retries` | `3` | 单条记录失败后最大重试次数 |
-
-## GRPO 奖励函数（plugin.py）
-
-`plugin.py` 为 [ms-swift](https://github.com/modelscope/ms-swift) 框架提供自定义 GRPO 奖励插件，使用 LLM-as-Judge 对模型输出进行多维度打分。
-
-### 评分维度
-
-| 维度 | 满分 | 评估内容 |
-|------|------|----------|
-| 结构完备性 | 2.0 | 是否覆盖灾害判定、损害评估、防治建议三大模块 |
-| 图像锚定精确度 | 3.0 | 分析是否锁定图像中的具体位置，拒绝通用模板 |
-| 术语使用与地质逻辑 | 3.0 | 专业词汇准确性与物理因果逻辑 |
-| 负面约束执行力 | 2.0 | 无开场白/结束语，不确定处使用"疑似"等词 |
-
-总分范围：**0 ~ 10**，四个维度并行异步打分后求和。
-
-### 配置方式
-
-通过环境变量控制奖励模型连接：
-
-```bash
-export GENRM_API_BASE=http://localhost:8001/v1   # 默认值
-export GENRM_TEMPERATURE=0.3                      # 默认值
-export GENRM_CONCURRENCY=4                        # 全局并发上限，默认 4
-```
-
-**并发控制：** 单个 completion 的 4 个维度通过 `asyncio.gather` 同时打分；全局 `asyncio.Semaphore(GENRM_CONCURRENCY)` 限制同时打到 vLLM 的请求总数，避免多 completion 并发时压垮服务。
-
-### 在 swift GRPO 训练中使用
-
-```bash
+# 强制限制输入图像最大像素约为 800x800，极大削减视觉 Token 数量，是防 OOM 的保命参数
+MAX_PIXELS=602112 \
 swift rlhf \
-  --rlhf_type grpo \
-  --external_plugins /path/to/plugin.py \
-  --reward_funcs LLM_as_judger \
-  ...
+     --rlhf_type grpo \
+     --model_type qwen3-vl-instruct \
+     # 挂载 Stage 2 阶段 SFT 训练并合并后的模型权重
+     --model_id_or_path /home/charles/mycode/grpo/model/sft_all_merged \
+     # 加载我们在 dataset_info.json 中注册好的 GRPO 纯问题数据集
+     --dataset remote_sensing_grpo \
+     --template qwen3_vl \
+     # 加载外部奖励计算插件（包含打分规则与网络请求逻辑）
+     --external_plugins /home/charles/mycode/grpo/plugin.py \
+     --reward_funcs LLM_as_judger \
+     # 开启 vLLM 加速生成阶段（Rollout），显著提升强化学习速度
+     --use_vllm true \
+     # 核心优化：同驻模式。vLLM 推理引擎与 PyTorch 训练引擎共享显卡，省去跨进程通信开销
+     --vllm_mode colocate \
+     # 极限显存切分：vLLM 仅占用单卡 20% 显存（约 9.6G）
+     --vllm_gpu_memory_utilization 0.2 \
+     --vllm_tensor_parallel_size 1 \
+     # 限制生成时的上下文最大长度
+     --vllm_max_model_len 16384 \
+     --torch_dtype bfloat16 \
+     --num_train_epochs 1 \
+     # 单卡 batch size 设为 1，多模态训练显存消耗极大，不可调大
+     --per_device_train_batch_size 1 \
+     # 梯度累加 16 次，相当于总 Batch Size = 3(卡) x 1 x 16 = 48
+     --gradient_accumulation_steps 16 \
+     --learning_rate 1e-6 \
+     # 完美负载均衡：每针对一个 prompt 生成 3 个回答。因有 3 张卡，每张卡刚好生成 1 个，毫无闲置
+     --num_generations 8 \
+     # 生成回答的温度，0.9 能带来较高的随机性，利于 GRPO 进行优劣对比学习
+     --temperature 0.9 \
+     # 使用 Zero2 策略拆分优化器状态与梯度，节省显存
+     --deepspeed zero2 \
+     # 因 5880 显存较大，默认关闭 CPU 卸载以换取极限训练速度。如仍 OOM，请改为 true
+     --offload_model false \
+     --offload_optimizer false \
+     # GRPO 训练数学参数：进行 Token 级别的重要度采样与优势值估计，使训练更加稳定
+     --importance_sampling_level token \
+     --advantage_estimator grpo \
+     --epsilon 0.2 \
+     # KL 惩罚系数，0.001 确保模型在学习新奖励的同时，不至于完全忘记 SFT 阶段的基础能力
+     --beta 0.001 \
+     # 模型一次最多能生成的文字 Token 长度
+     --max_completion_length 4096 \
+     --save_steps 100 \
+     --logging_steps 1 \
+     --report_to swanlab \
+     --swanlab_project swift-grpo \
+     --output_dir output_grpo
 ```
+
+> **硬件避坑指南**：若同一台机器上同时驻留了 32B 教师模型与这个 3 卡训练进程，即便拥有 3×48GB 显存，仍极度容易在生成长文本时引发 OOM。**一旦发生显存溢出，请立即将 `--offload_optimizer false` 改为 `true`**。
+
+---
+
+## 模型评估体系 (Evaluation Methodology)
+
+本项目建立了一套严谨的 **Teacher-as-a-Judge** 自动测评流水线，通过模拟“闭卷考试”来量化模型在遥感解译任务上的真实能力提升。
+
+### 1. 测评维度设计
+
+| 维度 | 任务描述 | 考察能力 |
+| :--- | :--- | :--- |
+| **Change Det (CoT)** | 针对前后两时相影像生成对比分析报告 | 变化敏感度、地学逻辑、专业表达 |
+| **VQA - Open (Q1)** | 对单图场景进行宏观描述与开放式回答 | 基础视觉感知、自然语言对齐 |
+| **VQA - Reason (Q2)** | 针对微小地物进行计数、方位及逻辑推理 | 精确目标定位、步进式推理 (Thinking) |
+
+### 2. 测评工作流 (Pipeline)
+
+测评过程分为三个阶段：**出题、考试、判卷**。
+
+1.  **出题**：教师模型 (8002) 读取图像，生成双尺度描述，并基于描述出题（Q1/Q2）同时提供标准参考答案。
+2.  **考试**：待测模型（学生或基线）仅凭图像和题目进行回答，不接触参考答案和描述。
+3.  **判卷**：教师模型 (8002) 重新看图，评估学生回答的准确性与专业性。
+
+### 3. 消融实验：对比基准 (Baseline)
+
+为了验证微调效果，建议按以下顺序运行完整的对比流程：
+
+```bash
+# 1. 微调后模型测评 (学生 8001)
+python3 evaluate_model.py
+
+# 2. 微调前模型测评 (基准 8003)
+python3 evaluate_baseline.py
+
+# 3. 自动判卷 (教师 8002)
+python3 score_evaluation.py                    # 判微调后
+python3 score_evaluation.py --input-dir evaluation/baseline  # 判基准
+
+# 4. 生成综合演进报告
+python3 print_final_report.py
+```
+
+### 4. 关键特性
+
+-   **全自动对比**：自动计算“提升幅度”百分比，直观展示训练收益。
+-   **天花板基准**：评分脚本会让教师模型也参加“闭卷考试”，建立起该任务下的理论最高分（Skyline），避免由于题目过难导致的低分误判。
+-   **断点续传**：所有测评与评分脚本均支持断点续传，遇到 API 报错重启即可，不浪费算力。
+
+---
+
+## 模型测评结果
+
+
+本项目使用 **Teacher-as-a-Judge** 模式对训练后的模型进行闭卷测评。由教师模型（Port 8002）出题和判卷。
+
+| 测评维度 | 学生得分 | 老师得分 | 达到老师水平 | 说明 |
+| :--- | :---: | :---: | :---: | :--- |
+| **1. Change Detection (CoT)** | **9.46** | **9.88** | 95.7% | 评估报告的专业性、准确性与逻辑性 |
+| **2. VQA - Open-ended (Q1)** | **7.63** | **9.32** | 81.9% | 评估对单图场景的宏观理解与描述 |
+| **3. VQA - Reasoning (Q2)** | **4.14** | **4.96** | 83.5% | 评估对细节地物计数、方位及逻辑推理 |
+
+**测评深度分析：**
+- **CoT (9.46 vs 9.88)**：学生在变化检测报告的格式规范上已极其接近老师水平。
+- **Q2 (4.14 vs 4.96)**：虽然分数较低，但老师模型在闭卷答题时也难以完全覆盖细节，学生已达到老师 **83.5%** 的性能。

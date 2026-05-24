@@ -10,9 +10,11 @@ def augment_question(question):
     自动识别问题类型（计数/位置/空间关系/属性/存在/方位/停放/综合），选对应模板改写。
     """
     prefix = ""
-    if "<image>\n" in question:
-        prefix = "<image>\n"
-        question = question.replace("<image>\n", "")
+    if "<image>" in question:
+        # Count all <image> tokens to support multi-image data (e.g., pre/post pairs)
+        image_count = question.count("<image>")
+        prefix = "<image>\n" * image_count
+        question = re.sub(r'<image>\s*', '', question).strip()
 
     question = question.strip()
 
@@ -488,13 +490,15 @@ def process_file(input_path, output_path=None):
 
 
 if __name__ == '__main__':
+    from data_builder.config import SFT_OUTPUT_DIR, VQA_OUTPUT_DIR
+
     files_to_process = [
-        "/home/charles/mycode/grpo/vqa_data/dual_scale_desc.jsonl",
-        "/home/charles/mycode/grpo/vqa_data/vqa_openended.jsonl",
-        "/home/charles/mycode/grpo/vqa_data/vqa_specific.jsonl",
-        "/home/charles/mycode/grpo/sft_data/EBD_sft.jsonl",
-        "/home/charles/mycode/grpo/sft_data/LEVIR-CD+_sft.jsonl",
-        "/home/charles/mycode/grpo/sft_data/SECOND_sft.jsonl"
+        str(VQA_OUTPUT_DIR / "dual_scale_desc.jsonl"),
+        str(VQA_OUTPUT_DIR / "vqa_openended.jsonl"),
+        str(VQA_OUTPUT_DIR / "vqa_specific.jsonl"),
+        str(SFT_OUTPUT_DIR / "EBD_sft.jsonl"),
+        str(SFT_OUTPUT_DIR / "LEVIR-CD+_sft.jsonl"),
+        str(SFT_OUTPUT_DIR / "SECOND_sft.jsonl"),
     ]
 
     for file_path in files_to_process:
