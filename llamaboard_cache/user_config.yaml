@@ -1,0 +1,6 @@
+cache_dir: null
+hub_name: modelscope
+lang: zh
+last_model: Qwen3-VL-4B-Instruct
+path_dict:
+  Qwen3-VL-4B-Instruct: /home/charles/mycode/grpo/model/sft_all_merged

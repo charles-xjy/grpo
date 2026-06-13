@@ -1,0 +1,11 @@
+### model
+model_name_or_path: /home/charles/.cache/modelscope/hub/models/Qwen/Qwen3-VL-4B-Instruct
+adapter_name_or_path: /home/charles/mycode/grpo/sft_output/checkpoint-2548
+template: qwen3_vl_nothink
+trust_remote_code: true
+
+### export
+export_dir: /home/charles/mycode/grpo/sft_stage1_merged
+export_size: 5
+export_device: cpu
+export_legacy_format: false
